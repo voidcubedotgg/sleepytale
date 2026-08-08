@@ -1,0 +1,117 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  workflow_call:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ==========================================================================
+  # Quick checks
+  # ==========================================================================
+  fmt:
+    name: Format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+
+  # Advisory scan of Cargo.lock. Deliberately left out of `ci-success`: a new
+  # RustSec advisory lands without any change to this repo, and that should
+  # surface as a red job rather than block every unrelated PR.
+  audit:
+    name: Cargo audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@cargo-audit
+      - run: cargo audit
+
+  # ==========================================================================
+  # Test
+  # ==========================================================================
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # --all-targets skips doctests, and `--doc` has nothing to run against a
+      # workspace of one binary crate, so this is the whole suite.
+      - name: Unit and integration tests
+        run: cargo test --workspace --all-targets
+
+  # ==========================================================================
+  # Release binaries (static musl, both server arches)
+  #
+  # Built with `cross` so both arches get a working musl toolchain without the
+  # host having to provide one.
+  # ==========================================================================
+  build:
+    name: Build (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-musl
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - uses: taiki-e/install-action@cross
+      - name: Build sleepytale
+        run: cross build --release --locked -p sleepytale --target ${{ matrix.target }}
+      - name: Verify binary is static
+        run: file target/${{ matrix.target }}/release/sleepytale
+      - uses: actions/upload-artifact@v7
+        with:
+          name: sleepytale-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/sleepytale
+          if-no-files-found: error
+
+  # ==========================================================================
+  # Summary job for branch protection
+  # ==========================================================================
+  ci-success:
+    name: CI Success
+    needs: [fmt, clippy, test, build]
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Check all jobs passed
+        run: |
+          if [[ "${{ needs.fmt.result }}" != "success" ]] || \
+             [[ "${{ needs.clippy.result }}" != "success" ]] || \
+             [[ "${{ needs.test.result }}" != "success" ]] || \
+             [[ "${{ needs.build.result }}" != "success" ]]; then
+            echo "One or more jobs failed"
+            exit 1
+          fi
+          echo "All CI jobs passed!"

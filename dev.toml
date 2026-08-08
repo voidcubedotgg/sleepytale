@@ -1,0 +1,9 @@
+idle_timeout = 30
+[server]
+command = "java"
+args = [
+  "-Xmx8G",
+  "-jar", "HytaleServer.jar",
+  "--assets", "Assets.zip",
+]
+working_dir="./hytale"

@@ -37,6 +37,7 @@ All keys are optional; durations are plain seconds.
 | `boot_timeout` | `300` | Give up waking if the boot banner has not appeared. |
 | `session_timeout` | `90` | Drop a relay session after this long without a datagram. Must exceed the server's `maxIdleTimeout`. |
 | `shutdown_grace` | `10` | Time the backend gets to exit on SIGTERM before it is killed. |
+| `server.provider` | `process` | Infrastructure adapter: `process` today; Docker/Kubernetes later. |
 | `server.command` | `java` | Program to run. |
 | `server.args` | `["-jar", "HytaleServer.jar"]` | Arguments; `-b <backend>` is appended. |
 | `server.working_dir` | `.` | Working directory for the child process. |

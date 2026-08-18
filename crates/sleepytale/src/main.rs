@@ -6,11 +6,10 @@
 //! `--auth-mode=authenticated` is unaffected.
 
 mod config;
-mod console;
+mod infra;
 mod knock;
 mod relay;
 mod state;
-mod supervisor;
 
 use anyhow::{Context, Result};
 use clap::Parser;

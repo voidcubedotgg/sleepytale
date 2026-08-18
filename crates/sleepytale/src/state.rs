@@ -15,10 +15,10 @@
 //! silence is the only response this client handles well.
 
 use crate::config::Config;
-use crate::console::ConsoleInput;
+use crate::infra::console::ConsoleInput;
+use crate::infra::{self, Backend};
 use crate::knock::is_quic_initial;
 use crate::relay::Relay;
-use crate::supervisor::Supervisor;
 use anyhow::{Context, Result};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -57,14 +57,14 @@ impl Proxy {
             }
 
             // --- Waking: boot the backend, dropping traffic until it is ready. ---
-            let supervisor = match self.wake(&public, console.clone(), &mut shutdown).await? {
-                Wake::Running(supervisor) => *supervisor,
+            let backend = match self.wake(&public, console.clone(), &mut shutdown).await? {
+                Wake::Running(backend) => backend,
                 Wake::Shutdown => return Ok(()),
                 Wake::Failed => continue,
             };
 
             // --- Running: relay until idle. ---
-            match self.serve(&public, supervisor, &mut shutdown).await? {
+            match self.serve(&public, backend, &mut shutdown).await? {
                 Stop::Shutdown => return Ok(()),
                 Stop::BackendGone | Stop::Idle => {}
             }
@@ -113,8 +113,16 @@ impl Proxy {
         console: Option<Arc<ConsoleInput>>,
         shutdown: &mut std::pin::Pin<&mut impl Future<Output = ()>>,
     ) -> Result<Wake> {
-        let mut supervisor = match Supervisor::spawn(&self.config, console).await {
-            Ok(supervisor) => supervisor,
+        let mut backend = match infra::create_backend(&self.config, console) {
+            Ok(backend) => backend,
+            Err(e) => {
+                tracing::error!(error = %e, "could not create the backend");
+                return Ok(Wake::Failed);
+            }
+        };
+
+        let deadline = match backend.start().await {
+            Ok(deadline) => deadline,
             Err(e) => {
                 tracing::error!(error = %e, "could not start the backend");
                 return Ok(Wake::Failed);
@@ -125,12 +133,12 @@ impl Proxy {
         let ready = loop {
             tokio::select! {
                 () = &mut *shutdown => {
-                    supervisor.stop(&self.config).await?;
+                    backend.stop().await?;
                     return Ok(Wake::Shutdown);
                 }
                 // Rebuilt after every datagram below. Its boot deadline is absolute, so
                 // a client retrying its Initial cannot keep a hung backend alive.
-                result = supervisor.wait_until_ready(&self.config) => break result,
+                result = backend.wait_until_ready(deadline) => break result,
                 received = public.recv_from(&mut buf) => {
                     match received {
                         Ok((len, from)) => tracing::debug!(
@@ -145,10 +153,10 @@ impl Proxy {
         };
 
         match ready {
-            Ok(()) => Ok(Wake::Running(Box::new(supervisor))),
+            Ok(()) => Ok(Wake::Running(backend)),
             Err(e) => {
                 tracing::error!(error = %e, "backend failed to start");
-                supervisor.stop(&self.config).await?;
+                backend.stop().await?;
                 Ok(Wake::Failed)
             }
         }
@@ -158,9 +166,16 @@ impl Proxy {
     async fn serve(
         &self,
         public: &Arc<UdpSocket>,
-        mut supervisor: Supervisor,
+        mut backend: Box<dyn Backend>,
         shutdown: &mut std::pin::Pin<&mut impl Future<Output = ()>>,
     ) -> Result<Stop> {
+        // Datagrams that arrived during the Waking→Running handoff can sit in the
+        // socket buffer. Relaying them is dangerous: the client may already have
+        // abandoned that QUIC connection attempt, and a stale Initial can collide
+        // with the fresh retry. Drop everything that was already queued.
+        let drained = drain_public(public).await;
+        tracing::debug!(drained, "cleared stale datagrams before relaying");
+
         let relay = Arc::new(Relay::new(
             Arc::clone(public),
             self.config.backend,
@@ -190,14 +205,14 @@ impl Proxy {
             })
         };
 
-        let outcome = self.watch(&relay, &mut supervisor, shutdown).await;
+        let outcome = self.watch(&relay, &mut *backend, shutdown).await;
 
         stop.store(true, Ordering::Relaxed);
         pump.abort();
         let _ = pump.await;
         relay.clear().await;
 
-        supervisor.stop(&self.config).await?;
+        backend.stop().await?;
         outcome
     }
 
@@ -205,7 +220,7 @@ impl Proxy {
     async fn watch(
         &self,
         relay: &Relay,
-        supervisor: &mut Supervisor,
+        backend: &mut dyn Backend,
         shutdown: &mut std::pin::Pin<&mut impl Future<Output = ()>>,
     ) -> Result<Stop> {
         let mut ticker = interval(TICK);
@@ -220,7 +235,7 @@ impl Proxy {
                 _ = ticker.tick() => {}
             }
 
-            if supervisor.has_exited()? {
+            if backend.has_exited()? {
                 tracing::warn!("backend exited on its own");
                 return Ok(Stop::BackendGone);
             }
@@ -241,6 +256,20 @@ impl Proxy {
             }
         }
     }
+}
+
+/// Drop any datagrams already queued on the public socket.
+///
+/// Used once when transitioning from `Waking` to `Running` so that traffic the client
+/// sent while the backend was still booting does not leak into the live relay.
+async fn drain_public(public: &UdpSocket) -> usize {
+    let mut buf = vec![0u8; MAX_DATAGRAM];
+    let mut count = 0;
+    while let Ok((len, from)) = public.try_recv_from(&mut buf) {
+        tracing::debug!(%from, bytes = len, "dropping a stale datagram");
+        count += 1;
+    }
+    count
 }
 
 /// Bind the public port, serving both address families from one socket where possible.
@@ -277,8 +306,8 @@ enum Stop {
 }
 
 enum Wake {
-    // Boxed: a `Supervisor` dwarfs the other two variants, and this is built once per wake.
-    Running(Box<Supervisor>),
+    // Boxed: a concrete backend dwarfs the other two variants, and this is built once per wake.
+    Running(Box<dyn Backend>),
     Failed,
     Shutdown,
 }

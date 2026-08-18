@@ -44,9 +44,20 @@ pub struct Config {
     pub shutdown_grace: Duration,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BackendProvider {
+    /// Run the server as a local child process.
+    #[default]
+    Process,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct ServerConfig {
+    /// Infrastructure provider that runs the backend.
+    pub provider: BackendProvider,
+
     /// Program to run, usually `java`.
     pub command: String,
 
@@ -77,6 +88,7 @@ impl Default for Config {
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
+            provider: BackendProvider::Process,
             command: "java".to_string(),
             args: vec!["-jar".to_string(), "HytaleServer.jar".to_string()],
             working_dir: PathBuf::from("."),
@@ -170,6 +182,13 @@ mod tests {
         assert_eq!(parsed.idle_timeout, config.idle_timeout);
         assert_eq!(parsed.listen, config.listen);
         assert_eq!(parsed.server.command, config.server.command);
+        assert_eq!(parsed.server.provider, BackendProvider::Process);
+    }
+
+    #[test]
+    fn provider_defaults_to_process() {
+        let config: Config = toml::from_str("listen = \"0.0.0.0:5520\"\n").unwrap();
+        assert_eq!(config.server.provider, BackendProvider::Process);
     }
 
     #[test]

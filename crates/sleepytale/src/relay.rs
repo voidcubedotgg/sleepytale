@@ -27,6 +27,8 @@ const MAX_DATAGRAM: usize = 64 * 1024;
 struct Session {
     /// Socket dedicated to this client, so backend replies demultiplex by port.
     upstream: Arc<UdpSocket>,
+    /// The backend selected from the connection's first Initial packet.
+    backend: SocketAddr,
     return_path: JoinHandle<()>,
     last_seen: Instant,
 }
@@ -34,20 +36,14 @@ struct Session {
 /// Relay state shared between the client-facing loop and the reaper.
 pub struct Relay {
     public: Arc<UdpSocket>,
-    backend: SocketAddr,
     session_timeout: std::time::Duration,
     sessions: Mutex<HashMap<SocketAddr, Session>>,
 }
 
 impl Relay {
-    pub fn new(
-        public: Arc<UdpSocket>,
-        backend: SocketAddr,
-        session_timeout: std::time::Duration,
-    ) -> Self {
+    pub fn new(public: Arc<UdpSocket>, session_timeout: std::time::Duration) -> Self {
         Self {
             public,
-            backend,
             session_timeout,
             sessions: Mutex::new(HashMap::new()),
         }
@@ -63,26 +59,42 @@ impl Relay {
         self.sessions.lock().await.len()
     }
 
+    /// The backend already selected for a client, if it has a live session.
+    pub async fn session_backend(&self, client: SocketAddr) -> Option<SocketAddr> {
+        self.sessions.lock().await.get(&client).map(|s| s.backend)
+    }
+
     /// Forward one datagram from a client, opening a session if this is a new address.
-    pub async fn forward_to_backend(&self, from: SocketAddr, datagram: &[u8]) -> Result<()> {
-        let upstream = self.session_for(from).await?;
+    pub async fn forward_to_backend(
+        &self,
+        from: SocketAddr,
+        backend: SocketAddr,
+        datagram: &[u8],
+    ) -> Result<()> {
+        let (upstream, backend) = self.session_for(from, backend).await?;
         upstream
-            .send_to(datagram, self.backend)
+            .send_to(datagram, backend)
             .await
             .with_context(|| format!("relaying {} bytes to the backend", datagram.len()))?;
         Ok(())
     }
 
-    async fn session_for(&self, client: SocketAddr) -> Result<Arc<UdpSocket>> {
+    /// Existing sessions keep their selected backend; `backend` only matters when opening
+    /// a connection from a new client address.
+    async fn session_for(
+        &self,
+        client: SocketAddr,
+        backend: SocketAddr,
+    ) -> Result<(Arc<UdpSocket>, SocketAddr)> {
         let mut sessions = self.sessions.lock().await;
 
         if let Some(session) = sessions.get_mut(&client) {
             session.last_seen = Instant::now();
-            return Ok(Arc::clone(&session.upstream));
+            return Ok((Arc::clone(&session.upstream), session.backend));
         }
 
         // Bind on the same family as the backend so send_to cannot fail on mismatch.
-        let bind: SocketAddr = match self.backend {
+        let bind: SocketAddr = match backend {
             SocketAddr::V4(_) => ([0, 0, 0, 0], 0).into(),
             SocketAddr::V6(_) => (std::net::Ipv6Addr::UNSPECIFIED, 0).into(),
         };
@@ -104,14 +116,13 @@ impl Relay {
             client,
             Session {
                 upstream: Arc::clone(&upstream),
+                backend,
                 last_seen: Instant::now(),
                 return_path,
             },
         );
 
-        // The backend sees this ephemeral address rather than the player's real one, so
-        // log the mapping — it is the only place the association survives.
-        Ok(upstream)
+        Ok((upstream, backend))
     }
 
     /// Pump backend replies for one session back to its client.
@@ -156,6 +167,33 @@ impl Relay {
         sessions.len()
     }
 
+    /// Number of live sessions routed to a backend, used for its idle lifecycle.
+    pub async fn session_count_for(&self, backend: SocketAddr) -> usize {
+        self.sessions
+            .lock()
+            .await
+            .values()
+            .filter(|session| session.backend == backend)
+            .count()
+    }
+
+    /// Drop every session pinned to one backend, e.g. after it exits on its own.
+    ///
+    /// A client's session is resolved from its source address before the route table is
+    /// consulted, so a stale entry would keep forwarding to a dead backend forever.
+    pub async fn drop_sessions_for(&self, backend: SocketAddr) {
+        let mut sessions = self.sessions.lock().await;
+        sessions.retain(|client, session| {
+            if session.backend == backend {
+                tracing::info!(%client, %backend, "closing session; the backend is gone");
+                session.return_path.abort();
+                false
+            } else {
+                true
+            }
+        });
+    }
+
     /// Drop every session, e.g. when the backend is going away.
     pub async fn clear(&self) {
         let mut sessions = self.sessions.lock().await;
@@ -185,14 +223,14 @@ mod tests {
 
         let public = any_socket().await;
         let public_addr = public.local_addr().unwrap();
-        let relay = Relay::new(Arc::clone(&public), backend_addr, Duration::from_secs(30));
+        let relay = Relay::new(Arc::clone(&public), Duration::from_secs(30));
 
         // Stand in for a player.
         let client = any_socket().await;
         let client_addr = client.local_addr().unwrap();
 
         relay
-            .forward_to_backend(client_addr, b"hello")
+            .forward_to_backend(client_addr, backend_addr, b"hello")
             .await
             .unwrap();
 
@@ -217,34 +255,40 @@ mod tests {
     #[tokio::test]
     async fn two_clients_get_separate_sessions() {
         let backend = any_socket().await;
-        let relay = Relay::new(
-            any_socket().await,
-            backend.local_addr().unwrap(),
-            Duration::from_secs(30),
-        );
+        let backend_addr = backend.local_addr().unwrap();
+        let relay = Relay::new(any_socket().await, Duration::from_secs(30));
 
         let a = any_socket().await.local_addr().unwrap();
         let b = any_socket().await.local_addr().unwrap();
-        relay.forward_to_backend(a, b"a").await.unwrap();
-        relay.forward_to_backend(b, b"b").await.unwrap();
+        relay
+            .forward_to_backend(a, backend_addr, b"a")
+            .await
+            .unwrap();
+        relay
+            .forward_to_backend(b, backend_addr, b"b")
+            .await
+            .unwrap();
         assert_eq!(relay.session_count().await, 2);
 
         // Repeat traffic reuses the session rather than opening another.
-        relay.forward_to_backend(a, b"a again").await.unwrap();
+        relay
+            .forward_to_backend(a, backend_addr, b"a again")
+            .await
+            .unwrap();
         assert_eq!(relay.session_count().await, 2);
     }
 
     #[tokio::test]
     async fn quiet_sessions_are_reaped() {
         let backend = any_socket().await;
-        let relay = Relay::new(
-            any_socket().await,
-            backend.local_addr().unwrap(),
-            Duration::from_millis(50),
-        );
+        let backend_addr = backend.local_addr().unwrap();
+        let relay = Relay::new(any_socket().await, Duration::from_millis(50));
 
         let client = any_socket().await.local_addr().unwrap();
-        relay.forward_to_backend(client, b"x").await.unwrap();
+        relay
+            .forward_to_backend(client, backend_addr, b"x")
+            .await
+            .unwrap();
         assert_eq!(relay.reap_idle().await, 1, "still fresh");
 
         tokio::time::sleep(Duration::from_millis(80)).await;
@@ -255,15 +299,15 @@ mod tests {
     #[tokio::test]
     async fn traffic_keeps_a_session_alive() {
         let backend = any_socket().await;
-        let relay = Relay::new(
-            any_socket().await,
-            backend.local_addr().unwrap(),
-            Duration::from_millis(100),
-        );
+        let backend_addr = backend.local_addr().unwrap();
+        let relay = Relay::new(any_socket().await, Duration::from_millis(100));
         let client = any_socket().await.local_addr().unwrap();
 
         for _ in 0..4 {
-            relay.forward_to_backend(client, b"tick").await.unwrap();
+            relay
+                .forward_to_backend(client, backend_addr, b"tick")
+                .await
+                .unwrap();
             tokio::time::sleep(Duration::from_millis(40)).await;
             assert_eq!(relay.reap_idle().await, 1);
         }
@@ -272,13 +316,10 @@ mod tests {
     #[tokio::test]
     async fn clear_drops_everything() {
         let backend = any_socket().await;
-        let relay = Relay::new(
-            any_socket().await,
-            backend.local_addr().unwrap(),
-            Duration::from_secs(30),
-        );
+        let backend_addr = backend.local_addr().unwrap();
+        let relay = Relay::new(any_socket().await, Duration::from_secs(30));
         relay
-            .forward_to_backend(any_socket().await.local_addr().unwrap(), b"x")
+            .forward_to_backend(any_socket().await.local_addr().unwrap(), backend_addr, b"x")
             .await
             .unwrap();
         relay.clear().await;

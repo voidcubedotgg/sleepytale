@@ -1,9 +1,25 @@
 idle_timeout = 30
+
+# Fallback route: anything whose SNI does not match a named route below.
+backend = "127.0.0.1:5521"
+
 [server]
 command = "java"
 args = [
   "-Xmx8G",
-  "-jar", "HytaleServer.jar",
-  "--assets", "Assets.zip",
+  "-jar", "/home/vscode/.hytale/HytaleServer.jar",
+  "--assets", "/home/vscode/.hytale/Assets.zip",
 ]
-working_dir="./hytale"
+working_dir = "./hytale"
+
+[routes."127.0.0.1.sslip.io"]
+backend = "127.0.0.1:5531"
+command = "java"
+args = [
+  "-Xmx8G",
+  "-jar", "/home/vscode/.hytale/HytaleServer.jar",
+  "--assets", "/home/vscode/.hytale/Assets.zip",
+]
+working_dir = "./hytale"
+# The fallback route keeps the console, because forward_stdin defaults to true.
+forward_stdin = false

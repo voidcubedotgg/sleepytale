@@ -9,6 +9,7 @@ mod config;
 mod infra;
 mod knock;
 mod relay;
+mod sni;
 mod state;
 
 use anyhow::{Context, Result};

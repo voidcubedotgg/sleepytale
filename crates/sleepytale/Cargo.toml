@@ -5,8 +5,12 @@ edition.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+aes = "0.8"
+aes-gcm = "0.10"
 clap.workspace = true
+hkdf = "0.12"
 serde.workspace = true
+sha2 = "0.10"
 socket2.workspace = true
 tokio.workspace = true
 toml.workspace = true

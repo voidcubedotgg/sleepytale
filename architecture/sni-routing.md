@@ -39,7 +39,9 @@ that same backend. This preserves Hytale's end-to-end QUIC, TLS, and mTLS behavi
   has no route name and uses the default backend.
 - Route-name matching is case-insensitive and ignores one trailing dot.
 - A sleeping route wakes only for a plausible QUIC v1 or v2 Initial. While it is waking,
-  datagrams are dropped; the client retransmits its Initial after the backend is ready.
+  Initials for that route are held — newest per client address, up to eight addresses —
+  and delivered the moment the backend is ready, so a client does not have to retransmit
+  for its attempt to succeed. Everything else is dropped.
 - A session remains pinned to its first route until it expires. An SNI change cannot
   move an existing connection.
 

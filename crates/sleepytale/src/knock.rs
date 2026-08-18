@@ -5,10 +5,28 @@
 //! is told `ServerDisconnect` before authentication closes the connection and reports it
 //! as a network error rather than showing the reason (client 0.5.7 — verified against a
 //! byte-perfect `ServerDisconnect`, which it read, acted on, and did not render). Silence
-//! is the one response the client handles well: it times out after ten seconds and dials
-//! again, and its retransmitted Initials land on the relay as soon as the backend is up.
+//! is the one response *at that layer* the client handles well.
 //!
-//! So the only thing the proxy needs from a sleeping port is "someone is trying to
+//! It is not, however, infinitely patient: the client (Quiche under the hood) gives up
+//! after about ten seconds with `QUIC handshake failed` and does not appear to auto-redial
+//! — a player has to reconnect by hand. A real boot routinely takes longer than that, so
+//! the ten-second window has to survive on its own; nothing about it makes a slow boot
+//! safe by itself.
+//!
+//! A QUIC Retry looks like the missing answer here — it is sent before any handshake
+//! exists, so it avoids the `ServerDisconnect` trap — but it cannot work through a relay
+//! that does not terminate the handshake. `RFC 9000` requires the client to repeat the
+//! Retry's token in every later Initial (§8.1.2) and to abort if the server omits
+//! `retry_source_connection_id` (§7.3). Those Initials reach the *backend*, which issued
+//! no token and sent no Retry, so it rejects them. A Retry with an empty token is worse
+//! still: §17.2.5.2 makes the client discard it unread, which is silence dressed up as a
+//! reply. This was tried and reverted.
+//!
+//! So the proxy answers nothing, and instead makes the client's own Initial count: it is
+//! held while the backend boots and delivered the moment it is ready (see `state::deliver_held`),
+//! which needs no forged packets and no reply the proxy has no standing to send.
+//!
+//! The only thing the proxy needs from a sleeping port is therefore "someone is trying to
 //! connect", which the shape of a QUIC Initial packet answers.
 
 /// Does this datagram look like a client opening a QUIC v1 or v2 connection?

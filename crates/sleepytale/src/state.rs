@@ -1,38 +1,46 @@
-//! The proxy's lifecycle: sleeping, waking, running.
-//!
-//! ```text
-//! Sleeping   the public socket is quiet; a QUIC Initial starts the backend
-//! Waking     datagrams are dropped while the backend boots; the client retries
-//! Running    datagrams are relayed to the backend
-//!            no sessions for idle_timeout -> stop the backend -> Sleeping
-//! ```
-//!
-//! One socket serves all three states, so the public port is never released and there is
-//! no window where the address is unbound. What changes between states is only what the
-//! proxy does with a datagram: ignore it, drop it, or relay it.
-//!
-//! Nothing is ever sent back from Sleeping or Waking. See [`crate::knock`] for why
-//! silence is the only response this client handles well.
+//! Lifecycle management for all SNI-routed backends.
 
-use crate::config::Config;
+use crate::config::{BackendConfig, Config, Routes};
 use crate::infra::console::ConsoleInput;
 use crate::infra::{self, Backend};
 use crate::knock::is_quic_initial;
 use crate::relay::Relay;
+use crate::sni;
 use anyhow::{Context, Result};
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::net::UdpSocket;
+use tokio::task::JoinHandle;
 use tokio::time::{Duration, Instant, MissedTickBehavior, interval};
 
-/// How often the relay checks for expired sessions and idle shutdown.
 const TICK: Duration = Duration::from_secs(5);
-
 const MAX_DATAGRAM: usize = 64 * 1024;
 
 pub struct Proxy {
     config: Config,
+}
+
+enum Lifecycle {
+    Sleeping,
+    Waking(JoinHandle<Result<Box<dyn Backend>>>),
+    Running(Box<dyn Backend>),
+}
+
+struct ManagedBackend {
+    config: BackendConfig,
+    lifecycle: Lifecycle,
+    empty_since: Option<Instant>,
+}
+
+impl ManagedBackend {
+    fn new(config: BackendConfig) -> Self {
+        Self {
+            config,
+            lifecycle: Lifecycle::Sleeping,
+            empty_since: None,
+        }
+    }
 }
 
 impl Proxy {
@@ -40,249 +48,204 @@ impl Proxy {
         Self { config }
     }
 
-    /// Run until `shutdown` resolves.
     pub async fn run(&self, shutdown: impl Future<Output = ()>) -> Result<()> {
         tokio::pin!(shutdown);
         let public = Arc::new(bind_public(self.config.listen).await?);
-        let console = match self.config.server.forward_stdin {
-            true => Some(Arc::new(ConsoleInput::start()?)),
-            false => None,
-        };
+        let console = self.console()?;
+        let routes = self.config.routes();
+        let mut backends: BTreeMap<SocketAddr, ManagedBackend> = routes
+            .all()
+            .map(|route| (route.backend, ManagedBackend::new(route)))
+            .collect();
+        let relay = Arc::new(Relay::new(Arc::clone(&public), self.config.session_timeout));
 
-        loop {
-            // --- Sleeping: ignore the port until someone dials in. ---
-            tracing::info!(listen = %self.config.listen, "sleeping");
-            if !self.wait_for_knock(&public, &mut shutdown).await? {
-                return Ok(());
-            }
-
-            // --- Waking: boot the backend, dropping traffic until it is ready. ---
-            let backend = match self.wake(&public, console.clone(), &mut shutdown).await? {
-                Wake::Running(backend) => backend,
-                Wake::Shutdown => return Ok(()),
-                Wake::Failed => continue,
-            };
-
-            // --- Running: relay until idle. ---
-            match self.serve(&public, backend, &mut shutdown).await? {
-                Stop::Shutdown => return Ok(()),
-                Stop::BackendGone | Stop::Idle => {}
-            }
-        }
-    }
-
-    /// Wait for a client to try to connect.
-    /// Returns `true` after a knock, or `false` when the proxy is stopping.
-    async fn wait_for_knock(
-        &self,
-        public: &UdpSocket,
-        shutdown: &mut std::pin::Pin<&mut impl Future<Output = ()>>,
-    ) -> Result<bool> {
-        let mut buf = vec![0u8; MAX_DATAGRAM];
-        loop {
-            let received = tokio::select! {
-                () = shutdown.as_mut() => return Ok(false),
-                received = public.recv_from(&mut buf) => received,
-            };
-            // A read error here is per-datagram, not fatal: Linux reports a queued ICMP
-            // port-unreachable from a client that vanished as ECONNREFUSED on the next
-            // recv. Giving up would close the public port for good, so this matches the
-            // other two read loops and keeps waiting.
-            let (len, from) = match received {
-                Ok(received) => received,
-                Err(e) => {
-                    tracing::debug!(error = %e, "public socket read failed");
-                    continue;
-                }
-            };
-
-            if is_quic_initial(&buf[..len]) {
-                tracing::info!(%from, "client knocked; waking the backend");
-                return Ok(true);
-            }
-            tracing::debug!(%from, bytes = len, "ignoring a datagram that is not a QUIC Initial");
-        }
-    }
-
-    /// Boot the backend. Knocks that arrive meanwhile are dropped: the client retransmits
-    /// its Initial and retries the whole connection, so one of those attempts lands on the
-    /// relay once the backend is ready.
-    async fn wake(
-        &self,
-        public: &UdpSocket,
-        console: Option<Arc<ConsoleInput>>,
-        shutdown: &mut std::pin::Pin<&mut impl Future<Output = ()>>,
-    ) -> Result<Wake> {
-        let mut backend = match infra::create_backend(&self.config, console) {
-            Ok(backend) => backend,
-            Err(e) => {
-                tracing::error!(error = %e, "could not create the backend");
-                return Ok(Wake::Failed);
-            }
-        };
-
-        let deadline = match backend.start().await {
-            Ok(deadline) => deadline,
-            Err(e) => {
-                tracing::error!(error = %e, "could not start the backend");
-                return Ok(Wake::Failed);
-            }
-        };
-
-        let mut buf = vec![0u8; MAX_DATAGRAM];
-        let ready = loop {
-            tokio::select! {
-                () = &mut *shutdown => {
-                    backend.stop().await?;
-                    return Ok(Wake::Shutdown);
-                }
-                // Rebuilt after every datagram below. Its boot deadline is absolute, so
-                // a client retrying its Initial cannot keep a hung backend alive.
-                result = backend.wait_until_ready(deadline) => break result,
-                received = public.recv_from(&mut buf) => {
-                    match received {
-                        Ok((len, from)) => tracing::debug!(
-                            %from,
-                            bytes = len,
-                            "dropping a datagram while the backend boots"
-                        ),
-                        Err(e) => tracing::debug!(error = %e, "public socket read failed"),
-                    }
-                }
-            }
-        };
-
-        match ready {
-            Ok(()) => Ok(Wake::Running(backend)),
-            Err(e) => {
-                tracing::error!(error = %e, "backend failed to start");
-                backend.stop().await?;
-                Ok(Wake::Failed)
-            }
-        }
-    }
-
-    /// Relay traffic until the server goes idle, dies, or the proxy is shut down.
-    async fn serve(
-        &self,
-        public: &Arc<UdpSocket>,
-        mut backend: Box<dyn Backend>,
-        shutdown: &mut std::pin::Pin<&mut impl Future<Output = ()>>,
-    ) -> Result<Stop> {
-        // Datagrams that arrived during the Waking→Running handoff can sit in the
-        // socket buffer. Relaying them is dangerous: the client may already have
-        // abandoned that QUIC connection attempt, and a stale Initial can collide
-        // with the fresh retry. Drop everything that was already queued.
-        let drained = drain_public(public).await;
-        tracing::debug!(drained, "cleared stale datagrams before relaying");
-
-        let relay = Arc::new(Relay::new(
-            Arc::clone(public),
-            self.config.backend,
-            self.config.session_timeout,
-        ));
-        tracing::info!(backend = %self.config.backend, "running");
-
-        let stop = Arc::new(AtomicBool::new(false));
-        let pump = {
-            let public = Arc::clone(public);
-            let relay = Arc::clone(&relay);
-            let stop = Arc::clone(&stop);
-            tokio::spawn(async move {
-                let mut buf = vec![0u8; MAX_DATAGRAM];
-                while !stop.load(Ordering::Relaxed) {
-                    let (len, from) = match public.recv_from(&mut buf).await {
-                        Ok(v) => v,
-                        Err(e) => {
-                            tracing::debug!(error = %e, "public socket read failed");
-                            continue;
-                        }
-                    };
-                    if let Err(e) = relay.forward_to_backend(from, &buf[..len]).await {
-                        tracing::debug!(%from, error = %e, "forwarding failed");
-                    }
-                }
-            })
-        };
-
-        let outcome = self.watch(&relay, &mut *backend, shutdown).await;
-
-        stop.store(true, Ordering::Relaxed);
-        pump.abort();
-        let _ = pump.await;
-        relay.clear().await;
-
-        backend.stop().await?;
-        outcome
-    }
-
-    /// Poll for idle shutdown, backend death, or proxy shutdown.
-    async fn watch(
-        &self,
-        relay: &Relay,
-        backend: &mut dyn Backend,
-        shutdown: &mut std::pin::Pin<&mut impl Future<Output = ()>>,
-    ) -> Result<Stop> {
+        tracing::info!(listen = %self.config.listen, routes = self.config.routes.len(), "sleeping");
         let mut ticker = interval(TICK);
         ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
-        // Grace before the first idle check, so a cold start is not shut straight back
-        // down while the waking player is still connecting.
-        let mut empty_since = Some(Instant::now());
+        let mut buf = vec![0; MAX_DATAGRAM];
 
         loop {
             tokio::select! {
-                () = shutdown.as_mut() => return Ok(Stop::Shutdown),
-                _ = ticker.tick() => {}
+                () = shutdown.as_mut() => break,
+                _ = ticker.tick() => self.tick(&relay, &mut backends).await,
+                received = public.recv_from(&mut buf) => match received {
+                    Ok((len, client)) => {
+                        if let Err(error) = self.handle_datagram(
+                            client, &buf[..len], &routes, &relay, &mut backends, console.clone(),
+                        ).await {
+                            tracing::warn!(%client, %error, "dropping a datagram");
+                        }
+                    }
+                    Err(error) => tracing::debug!(%error, "public socket read failed"),
+                },
             }
+        }
 
-            if backend.has_exited()? {
-                tracing::warn!("backend exited on its own");
-                return Ok(Stop::BackendGone);
-            }
-
-            match relay.reap_idle().await {
-                0 => {
-                    let since = *empty_since.get_or_insert_with(Instant::now);
-                    if since.elapsed() >= self.config.idle_timeout {
-                        tracing::info!(idle = ?since.elapsed(), "no players; stopping backend");
-                        return Ok(Stop::Idle);
+        relay.clear().await;
+        for managed in backends.values_mut() {
+            let addr = managed.config.backend;
+            match std::mem::replace(&mut managed.lifecycle, Lifecycle::Sleeping) {
+                Lifecycle::Running(mut backend) => stop_backend(addr, &mut backend).await,
+                // Aborting would drop the adapter, and `kill_on_drop` only reaches the
+                // direct child; `stop` is the one path that signals the whole process
+                // group. Let startup finish, then stop what it produced.
+                Lifecycle::Waking(task) => {
+                    match tokio::time::timeout(self.config.shutdown_grace, task).await {
+                        Ok(Ok(Ok(mut backend))) => stop_backend(addr, &mut backend).await,
+                        Ok(Ok(Err(error))) => {
+                            tracing::error!(backend = %addr, %error, "backend failed to start")
+                        }
+                        Ok(Err(error)) => {
+                            tracing::error!(backend = %addr, %error, "backend startup task failed")
+                        }
+                        Err(_) => tracing::warn!(
+                            backend = %addr,
+                            "gave up waiting for a waking backend; it may outlive the proxy"
+                        ),
                     }
                 }
-                n => {
-                    if empty_since.take().is_some() {
-                        tracing::debug!(players = n, "no longer idle");
+                Lifecycle::Sleeping => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// Start the shared console reader when a backend wants stdin. `Config::validate`
+    /// has already established that at most one of them does.
+    fn console(&self) -> Result<Option<Arc<ConsoleInput>>> {
+        let interactive = std::iter::once(&self.config.server)
+            .chain(self.config.routes.values().map(|route| &route.server))
+            .any(|server| server.forward_stdin);
+        if interactive {
+            Ok(Some(Arc::new(ConsoleInput::start()?)))
+        } else {
+            Ok(None)
+        }
+    }
+
+    async fn handle_datagram(
+        &self,
+        client: SocketAddr,
+        datagram: &[u8],
+        routes: &Routes,
+        relay: &Relay,
+        backends: &mut BTreeMap<SocketAddr, ManagedBackend>,
+        console: Option<Arc<ConsoleInput>>,
+    ) -> Result<()> {
+        // Later QUIC datagrams are encrypted, so the source-address session owns the
+        // route after its first packet. Only a new address needs an SNI lookup.
+        let target = relay.session_backend(client).await.unwrap_or_else(|| {
+            routes
+                .resolve(sni::peek_server_name(datagram).as_deref())
+                .backend
+        });
+        let managed = backends
+            .get_mut(&target)
+            .context("selected backend is not configured")?;
+        match &managed.lifecycle {
+            Lifecycle::Running(_) => {
+                if let Err(error) = relay.forward_to_backend(client, target, datagram).await {
+                    tracing::debug!(%client, %error, "forwarding failed");
+                }
+            }
+            Lifecycle::Sleeping if is_quic_initial(datagram) => {
+                tracing::info!(%client, backend = %target, "client knocked; waking backend");
+                let config = self.config.clone();
+                let backend = managed.config.clone();
+                let backend_console = backend.server.forward_stdin.then_some(console).flatten();
+                managed.lifecycle = Lifecycle::Waking(tokio::spawn(async move {
+                    let mut adapter = infra::create_backend(&config, &backend, backend_console)?;
+                    let deadline = adapter.start().await?;
+                    adapter.wait_until_ready(deadline).await?;
+                    Ok(adapter)
+                }));
+            }
+            Lifecycle::Sleeping | Lifecycle::Waking(_) => {
+                tracing::debug!(%client, backend = %target, bytes = datagram.len(), "dropping a datagram while backend is unavailable");
+            }
+        }
+        Ok(())
+    }
+
+    /// Advance every backend's lifecycle.
+    ///
+    /// Errors are scoped to the backend that produced them: one broken route must not
+    /// stop the others from being managed, nor end the proxy.
+    async fn tick(&self, relay: &Relay, backends: &mut BTreeMap<SocketAddr, ManagedBackend>) {
+        relay.reap_idle().await;
+        for managed in backends.values_mut() {
+            let addr = managed.config.backend;
+            if let Lifecycle::Waking(task) = &managed.lifecycle
+                && task.is_finished()
+            {
+                let Lifecycle::Waking(task) =
+                    std::mem::replace(&mut managed.lifecycle, Lifecycle::Sleeping)
+                else {
+                    unreachable!()
+                };
+                match task.await {
+                    Ok(Ok(backend)) => {
+                        tracing::info!(backend = %addr, "backend ready");
+                        managed.lifecycle = Lifecycle::Running(backend);
+                        managed.empty_since = Some(Instant::now());
                     }
+                    Ok(Err(error)) => {
+                        tracing::error!(backend = %addr, %error, "backend failed to start")
+                    }
+                    Err(error) => {
+                        tracing::error!(backend = %addr, %error, "backend startup task failed")
+                    }
+                }
+            }
+            if let Lifecycle::Running(backend) = &mut managed.lifecycle {
+                match backend.has_exited() {
+                    Ok(false) => {}
+                    Ok(true) => {
+                        tracing::warn!(backend = %addr, "backend exited on its own");
+                        managed.lifecycle = Lifecycle::Sleeping;
+                        // Sessions resolve by source address before the route table, so
+                        // leaving them pinned would forward to a backend that is gone.
+                        managed.empty_since = None;
+                        relay.drop_sessions_for(addr).await;
+                        continue;
+                    }
+                    Err(error) => {
+                        tracing::error!(backend = %addr, %error, "checking whether the backend exited");
+                        continue;
+                    }
+                }
+                if relay.session_count_for(addr).await == 0 {
+                    let since = *managed.empty_since.get_or_insert_with(Instant::now);
+                    if since.elapsed() >= self.config.idle_timeout {
+                        tracing::info!(backend = %addr, idle = ?since.elapsed(), "no players; stopping backend");
+                        let Lifecycle::Running(mut backend) =
+                            std::mem::replace(&mut managed.lifecycle, Lifecycle::Sleeping)
+                        else {
+                            unreachable!()
+                        };
+                        managed.empty_since = None;
+                        stop_backend(addr, &mut backend).await;
+                    }
+                } else {
+                    managed.empty_since = None;
                 }
             }
         }
     }
 }
 
-/// Drop any datagrams already queued on the public socket.
-///
-/// Used once when transitioning from `Waking` to `Running` so that traffic the client
-/// sent while the backend was still booting does not leak into the live relay.
-async fn drain_public(public: &UdpSocket) -> usize {
-    let mut buf = vec![0u8; MAX_DATAGRAM];
-    let mut count = 0;
-    while let Ok((len, from)) = public.try_recv_from(&mut buf) {
-        tracing::debug!(%from, bytes = len, "dropping a stale datagram");
-        count += 1;
+/// Stop one backend, logging rather than propagating — a failure to stop concerns only
+/// that backend.
+async fn stop_backend(addr: SocketAddr, backend: &mut Box<dyn Backend>) {
+    if let Err(error) = backend.stop().await {
+        tracing::error!(backend = %addr, %error, "stopping the backend");
     }
-    count
 }
 
-/// Bind the public port, serving both address families from one socket where possible.
-///
-/// The real server opens an IPv4 and an IPv6 channel (`QUICTransport`, "Using IPv4/IPv6
-/// Datagram Channel"). A client resolving a name to both families tries IPv6 first, so a
-/// v4-only proxy costs every cold connect the client's full ten-second handshake timeout
-/// before it falls back.
 async fn bind_public(addr: SocketAddr) -> Result<UdpSocket> {
     let domain = socket2::Domain::for_address(addr);
     let socket = socket2::Socket::new(domain, socket2::Type::DGRAM, Some(socket2::Protocol::UDP))
         .context("creating the public socket")?;
-
     if addr.is_ipv6() && addr.ip().is_unspecified() {
         socket
             .set_only_v6(false)
@@ -294,70 +257,5 @@ async fn bind_public(addr: SocketAddr) -> Result<UdpSocket> {
     socket
         .bind(&addr.into())
         .with_context(|| format!("binding {addr}"))?;
-
     UdpSocket::from_std(socket.into()).context("handing the public socket to tokio")
-}
-
-#[derive(Debug, PartialEq, Eq)]
-enum Stop {
-    Idle,
-    BackendGone,
-    Shutdown,
-}
-
-enum Wake {
-    // Boxed: a concrete backend dwarfs the other two variants, and this is built once per wake.
-    Running(Box<dyn Backend>),
-    Failed,
-    Shutdown,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use tokio::sync::oneshot;
-    use tokio::time::{sleep, timeout};
-
-    #[tokio::test]
-    async fn sleeping_proxy_releases_promptly_on_shutdown() {
-        let config = Config {
-            listen: "127.0.0.1:57121".parse().unwrap(),
-            ..Config::default()
-        };
-
-        let (stop, stopped) = oneshot::channel();
-        let proxy = Proxy::new(config);
-        let task = tokio::spawn(async move {
-            proxy
-                .run(async move {
-                    let _ = stopped.await;
-                })
-                .await
-        });
-
-        // Give the proxy enough time to acquire its UDP socket before stopping it.
-        sleep(Duration::from_millis(25)).await;
-        stop.send(()).unwrap();
-        timeout(Duration::from_secs(1), task)
-            .await
-            .expect("sleeping proxy did not stop promptly")
-            .unwrap()
-            .unwrap();
-    }
-
-    #[tokio::test]
-    async fn an_unspecified_ipv6_bind_also_serves_ipv4_clients() {
-        let public = bind_public("[::]:57122".parse().unwrap()).await.unwrap();
-
-        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        client.send_to(b"hello", "127.0.0.1:57122").await.unwrap();
-
-        let mut buf = [0u8; 16];
-        let (len, from) = timeout(Duration::from_secs(1), public.recv_from(&mut buf))
-            .await
-            .expect("an IPv4 client could not reach the dual-stack socket")
-            .unwrap();
-        assert_eq!(&buf[..len], b"hello");
-        assert_eq!(from.ip().to_canonical(), client.local_addr().unwrap().ip());
-    }
 }

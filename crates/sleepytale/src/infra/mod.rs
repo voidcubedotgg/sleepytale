@@ -17,7 +17,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Instant;
 
-use crate::config::{BackendProvider, Config};
+use crate::config::{BackendConfig, BackendProvider, Config};
 use crate::infra::console::ConsoleInput;
 
 pub mod console;
@@ -40,10 +40,7 @@ pub trait Backend: Send {
     fn start<'a>(&'a mut self) -> BoxFuture<'a, Result<Instant>>;
 
     /// Wait for the backend to be ready to receive traffic, or for `deadline` to pass.
-    fn wait_until_ready<'a>(
-        &'a mut self,
-        deadline: Instant,
-    ) -> BoxFuture<'a, Result<()>>;
+    fn wait_until_ready<'a>(&'a mut self, deadline: Instant) -> BoxFuture<'a, Result<()>>;
 
     /// Has the backend already exited?
     fn has_exited(&mut self) -> Result<bool>;
@@ -58,9 +55,12 @@ pub trait Backend: Send {
 /// Kubernetes, and cloud providers will be selected from configuration.
 pub fn create_backend(
     config: &Config,
+    backend: &BackendConfig,
     console: Option<Arc<ConsoleInput>>,
 ) -> Result<Box<dyn Backend>> {
-    match config.server.provider {
-        BackendProvider::Process => Ok(Box::new(process::ProcessBackend::new(config, console)?)),
+    match backend.server.provider {
+        BackendProvider::Process => Ok(Box::new(process::ProcessBackend::new(
+            config, backend, console,
+        )?)),
     }
 }

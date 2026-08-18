@@ -68,7 +68,8 @@ providers all share the router without router-specific provider logic. Each runn
 route is stopped after `idle_timeout` with no sessions routed to it.
 
 Configuration rejects duplicate normalised route names, a route using the public listen
-address, and any backend address shared by the default route or another named route.
+address, any backend address shared by the default route or another named route, and a
+backend port of 0 — the server would bind an ephemeral port the proxy cannot forward to.
 Since terminal input has one source, at most one configured backend may set
 `forward_stdin = true`.
 

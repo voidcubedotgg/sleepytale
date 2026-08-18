@@ -67,23 +67,42 @@ impl Proxy {
         loop {
             tokio::select! {
                 () = shutdown.as_mut() => break,
-                _ = ticker.tick() => self.tick(&relay, &mut backends).await?,
+                _ = ticker.tick() => self.tick(&relay, &mut backends).await,
                 received = public.recv_from(&mut buf) => match received {
-                    Ok((len, client)) => self.handle_datagram(
-                        client, &buf[..len], &routes, &relay, &mut backends, console.clone(),
-                    ).await?,
+                    Ok((len, client)) => {
+                        if let Err(error) = self.handle_datagram(
+                            client, &buf[..len], &routes, &relay, &mut backends, console.clone(),
+                        ).await {
+                            tracing::warn!(%client, %error, "dropping a datagram");
+                        }
+                    }
                     Err(error) => tracing::debug!(%error, "public socket read failed"),
                 },
             }
         }
 
         relay.clear().await;
-        for backend in backends.values_mut() {
-            match std::mem::replace(&mut backend.lifecycle, Lifecycle::Sleeping) {
-                Lifecycle::Running(mut backend) => backend.stop().await?,
+        for managed in backends.values_mut() {
+            let addr = managed.config.backend;
+            match std::mem::replace(&mut managed.lifecycle, Lifecycle::Sleeping) {
+                Lifecycle::Running(mut backend) => stop_backend(addr, &mut backend).await,
+                // Aborting would drop the adapter, and `kill_on_drop` only reaches the
+                // direct child; `stop` is the one path that signals the whole process
+                // group. Let startup finish, then stop what it produced.
                 Lifecycle::Waking(task) => {
-                    task.abort();
-                    let _ = task.await;
+                    match tokio::time::timeout(self.config.shutdown_grace, task).await {
+                        Ok(Ok(Ok(mut backend))) => stop_backend(addr, &mut backend).await,
+                        Ok(Ok(Err(error))) => {
+                            tracing::error!(backend = %addr, %error, "backend failed to start")
+                        }
+                        Ok(Err(error)) => {
+                            tracing::error!(backend = %addr, %error, "backend startup task failed")
+                        }
+                        Err(_) => tracing::warn!(
+                            backend = %addr,
+                            "gave up waiting for a waking backend; it may outlive the proxy"
+                        ),
+                    }
                 }
                 Lifecycle::Sleeping => {}
             }
@@ -91,16 +110,13 @@ impl Proxy {
         Ok(())
     }
 
+    /// Start the shared console reader when a backend wants stdin. `Config::validate`
+    /// has already established that at most one of them does.
     fn console(&self) -> Result<Option<Arc<ConsoleInput>>> {
         let interactive = std::iter::once(&self.config.server)
             .chain(self.config.routes.values().map(|route| &route.server))
-            .filter(|server| server.forward_stdin)
-            .count();
-        anyhow::ensure!(
-            interactive <= 1,
-            "only one backend may set forward_stdin = true"
-        );
-        if interactive == 1 {
+            .any(|server| server.forward_stdin);
+        if interactive {
             Ok(Some(Arc::new(ConsoleInput::start()?)))
         } else {
             Ok(None)
@@ -151,13 +167,14 @@ impl Proxy {
         Ok(())
     }
 
-    async fn tick(
-        &self,
-        relay: &Relay,
-        backends: &mut BTreeMap<SocketAddr, ManagedBackend>,
-    ) -> Result<()> {
+    /// Advance every backend's lifecycle.
+    ///
+    /// Errors are scoped to the backend that produced them: one broken route must not
+    /// stop the others from being managed, nor end the proxy.
+    async fn tick(&self, relay: &Relay, backends: &mut BTreeMap<SocketAddr, ManagedBackend>) {
         relay.reap_idle().await;
         for managed in backends.values_mut() {
+            let addr = managed.config.backend;
             if let Lifecycle::Waking(task) = &managed.lifecycle
                 && task.is_finished()
             {
@@ -166,40 +183,62 @@ impl Proxy {
                 else {
                     unreachable!()
                 };
-                match task.await.context("joining backend startup task")? {
-                    Ok(backend) => {
-                        tracing::info!(backend = %managed.config.backend, "backend ready");
+                match task.await {
+                    Ok(Ok(backend)) => {
+                        tracing::info!(backend = %addr, "backend ready");
                         managed.lifecycle = Lifecycle::Running(backend);
                         managed.empty_since = Some(Instant::now());
                     }
+                    Ok(Err(error)) => {
+                        tracing::error!(backend = %addr, %error, "backend failed to start")
+                    }
                     Err(error) => {
-                        tracing::error!(backend = %managed.config.backend, %error, "backend failed to start")
+                        tracing::error!(backend = %addr, %error, "backend startup task failed")
                     }
                 }
             }
             if let Lifecycle::Running(backend) = &mut managed.lifecycle {
-                if backend.has_exited()? {
-                    tracing::warn!(backend = %managed.config.backend, "backend exited on its own");
-                    managed.lifecycle = Lifecycle::Sleeping;
-                    continue;
+                match backend.has_exited() {
+                    Ok(false) => {}
+                    Ok(true) => {
+                        tracing::warn!(backend = %addr, "backend exited on its own");
+                        managed.lifecycle = Lifecycle::Sleeping;
+                        // Sessions resolve by source address before the route table, so
+                        // leaving them pinned would forward to a backend that is gone.
+                        managed.empty_since = None;
+                        relay.drop_sessions_for(addr).await;
+                        continue;
+                    }
+                    Err(error) => {
+                        tracing::error!(backend = %addr, %error, "checking whether the backend exited");
+                        continue;
+                    }
                 }
-                if relay.session_count_for(managed.config.backend).await == 0 {
+                if relay.session_count_for(addr).await == 0 {
                     let since = *managed.empty_since.get_or_insert_with(Instant::now);
                     if since.elapsed() >= self.config.idle_timeout {
-                        tracing::info!(backend = %managed.config.backend, idle = ?since.elapsed(), "no players; stopping backend");
+                        tracing::info!(backend = %addr, idle = ?since.elapsed(), "no players; stopping backend");
                         let Lifecycle::Running(mut backend) =
                             std::mem::replace(&mut managed.lifecycle, Lifecycle::Sleeping)
                         else {
                             unreachable!()
                         };
-                        backend.stop().await?;
+                        managed.empty_since = None;
+                        stop_backend(addr, &mut backend).await;
                     }
                 } else {
                     managed.empty_since = None;
                 }
             }
         }
-        Ok(())
+    }
+}
+
+/// Stop one backend, logging rather than propagating — a failure to stop concerns only
+/// that backend.
+async fn stop_backend(addr: SocketAddr, backend: &mut Box<dyn Backend>) {
+    if let Err(error) = backend.stop().await {
+        tracing::error!(backend = %addr, %error, "stopping the backend");
     }
 }
 

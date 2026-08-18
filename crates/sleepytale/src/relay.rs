@@ -122,8 +122,6 @@ impl Relay {
             },
         );
 
-        // The backend sees this ephemeral address rather than the player's real one, so
-        // log the mapping — it is the only place the association survives.
         Ok((upstream, backend))
     }
 
@@ -177,6 +175,23 @@ impl Relay {
             .values()
             .filter(|session| session.backend == backend)
             .count()
+    }
+
+    /// Drop every session pinned to one backend, e.g. after it exits on its own.
+    ///
+    /// A client's session is resolved from its source address before the route table is
+    /// consulted, so a stale entry would keep forwarding to a dead backend forever.
+    pub async fn drop_sessions_for(&self, backend: SocketAddr) {
+        let mut sessions = self.sessions.lock().await;
+        sessions.retain(|client, session| {
+            if session.backend == backend {
+                tracing::info!(%client, %backend, "closing session; the backend is gone");
+                session.return_path.abort();
+                false
+            } else {
+                true
+            }
+        });
     }
 
     /// Drop every session, e.g. when the backend is going away.

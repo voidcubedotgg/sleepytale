@@ -136,6 +136,10 @@ impl Config {
             "listen port must be fixed, not 0 — players need a stable port to reconnect to"
         );
         anyhow::ensure!(
+            self.backend.port() != 0,
+            "backend port must be fixed, not 0 — the proxy has to know where to forward"
+        );
+        anyhow::ensure!(
             !self.server.command.is_empty(),
             "server.command must not be empty"
         );
@@ -147,6 +151,10 @@ impl Config {
                 (1..=MAX_SERVER_NAME).contains(&name.len()),
                 "route names must be 1 to {MAX_SERVER_NAME} characters; {name:?} is {}",
                 name.len()
+            );
+            anyhow::ensure!(
+                route.backend.port() != 0,
+                "route {name:?} backend port must be fixed, not 0"
             );
             anyhow::ensure!(
                 route.backend != self.listen,
@@ -167,6 +175,16 @@ impl Config {
                 "route {name:?}.command must not be empty"
             );
         }
+        // Checked here rather than at startup so `load` and `--print-config` reject it
+        // before the proxy has bound the public socket.
+        let interactive = std::iter::once(&self.server)
+            .chain(self.routes.values().map(|route| &route.server))
+            .filter(|server| server.forward_stdin)
+            .count();
+        anyhow::ensure!(
+            interactive <= 1,
+            "only one backend may set forward_stdin = true; {interactive} do"
+        );
         Ok(())
     }
 
@@ -291,6 +309,8 @@ mod tests {
                 backend: "127.0.0.1:5531".parse().unwrap(),
                 server: ServerConfig {
                     command: "creative-server".into(),
+                    // The default backend already claims stdin.
+                    forward_stdin: false,
                     ..ServerConfig::default()
                 },
             },
@@ -301,6 +321,45 @@ mod tests {
         assert_eq!(route.backend, "127.0.0.1:5531".parse().unwrap());
         assert_eq!(route.server.command, "creative-server");
         assert_eq!(routes.resolve(None).backend, config.backend);
+    }
+
+    #[test]
+    fn a_backend_port_of_zero_is_rejected() {
+        let mut config = Config::default();
+        config.backend.set_port(0);
+        assert!(config.validate().is_err(), "the default backend");
+
+        let mut config = Config::default();
+        config.routes.insert(
+            "creative.example.com".into(),
+            BackendConfig {
+                backend: "127.0.0.1:0".parse().unwrap(),
+                server: ServerConfig {
+                    forward_stdin: false,
+                    ..ServerConfig::default()
+                },
+            },
+        );
+        assert!(config.validate().is_err(), "a route backend");
+    }
+
+    /// Rejected here rather than at startup, so `--print-config` catches it before the
+    /// proxy has bound the public socket.
+    #[test]
+    fn only_one_backend_may_forward_stdin() {
+        let mut config = Config::default();
+        assert!(config.server.forward_stdin, "the default holds the console");
+        config.routes.insert(
+            "creative.example.com".into(),
+            BackendConfig {
+                backend: "127.0.0.1:5531".parse().unwrap(),
+                server: ServerConfig::default(),
+            },
+        );
+        assert!(config.validate().is_err());
+
+        config.server.forward_stdin = false;
+        config.validate().unwrap();
     }
 
     #[test]

@@ -55,7 +55,8 @@ working_dir = "./hytale"
 
 Several sleeping servers can share the public port. Each named route has its own private
 bind address and infrastructure adapter configuration; at most one backend may enable
-`forward_stdin`.
+`forward_stdin`. It defaults to `true`, so the fallback route holds the console unless
+`[server] forward_stdin = false` frees it for a named route.
 
 ```toml
 [routes."creative.example.com"]

@@ -12,7 +12,7 @@ waiting out a timeout. Once up, the proxy relays raw UDP, so QUIC and mTLS run e
 and `--auth-mode=authenticated` is unaffected. After `idle_timeout` with no sessions, the
 backend is stopped and the port goes quiet again.
 
-```
+```text
 Sleeping   the public socket is quiet; a QUIC Initial starts the backend
 Waking     Initials are held while the backend boots; everything else is dropped
 Running    held Initials are delivered, then datagrams are relayed to the backend

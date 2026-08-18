@@ -23,7 +23,7 @@
 //! reply. This was tried and reverted.
 //!
 //! So the proxy answers nothing, and instead makes the client's own Initial count: it is
-//! held while the backend boots and delivered the moment it is ready (see `state::wake`),
+//! held while the backend boots and delivered the moment it is ready (see `state::deliver_held`),
 //! which needs no forged packets and no reply the proxy has no standing to send.
 //!
 //! The only thing the proxy needs from a sleeping port is therefore "someone is trying to

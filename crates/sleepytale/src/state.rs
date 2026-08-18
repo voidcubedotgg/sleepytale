@@ -576,7 +576,7 @@ mod tests {
     async fn holding_initials_is_capped_per_backend() {
         let backend_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let backend_addr = backend_socket.local_addr().unwrap();
-        let mut harness = Harness::new(shell_proxy(backend_addr, Duration::from_secs(30))).await;
+        let mut harness = Harness::new(shell_proxy(backend_addr, Duration::ZERO)).await;
 
         for port in 0..MAX_HELD_CLIENTS + 4 {
             let client: SocketAddr = format!("127.0.0.1:{}", 40000 + port).parse().unwrap();
@@ -584,6 +584,9 @@ mod tests {
         }
         assert_eq!(harness.backends[&backend_addr].held.len(), MAX_HELD_CLIENTS);
 
+        // Reach Running before tearing down: `shutdown` only stops a Running backend, and
+        // aborting a Waking one leaves the launcher's grandchild alive.
+        harness.tick_until_running(backend_addr).await;
         harness.shutdown().await;
     }
 

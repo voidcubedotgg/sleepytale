@@ -5,14 +5,22 @@
 //! is told `ServerDisconnect` before authentication closes the connection and reports it
 //! as a network error rather than showing the reason (client 0.5.7 — verified against a
 //! byte-perfect `ServerDisconnect`, which it read, acted on, and did not render). Silence
-//! is the one response *at that layer* the client handles well: it times out after ten
-//! seconds and dials again, and its retransmitted Initials land on the relay as soon as
-//! the backend is up.
+//! is the one response *at that layer* the client handles well.
+//!
+//! It is not, however, infinitely patient: the client (Quiche under the hood) gives up
+//! after about ten seconds with `QUIC handshake failed` and does not appear to auto-redial
+//! — a player has to reconnect by hand. A real boot routinely takes longer than that, so
+//! the ten-second window has to survive on its own; nothing about it makes a slow boot
+//! safe by itself.
 //!
 //! A QUIC Retry (see [`crate::retry`]) is different from `ServerDisconnect`, not another
 //! instance of the same mistake: it is sent before any handshake exists, so a compliant
 //! client reads it as "the server is here, retry" rather than as the failure of a
-//! connection it thought had progressed further. The proxy still sends it.
+//! connection it thought had progressed further, and receiving one is what keeps the
+//! client's own handshake timer from expiring while Waking runs long. The proxy still
+//! sends it — and now takes care not to drop the datagram that answers it right at the
+//! Waking→Running handoff (see `state::serve`), since that datagram, not another retry, is
+//! usually the one that finishes the connection.
 //!
 //! So the only thing the proxy needs from a sleeping port is "someone is trying to
 //! connect", which the shape of a QUIC Initial packet answers.

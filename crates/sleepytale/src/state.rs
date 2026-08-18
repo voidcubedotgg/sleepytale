@@ -1,8 +1,8 @@
 //! The proxy's lifecycle: sleeping, waking, running.
 //!
 //! ```text
-//! Sleeping   the public socket is quiet; a QUIC Initial starts the backend
-//! Waking     datagrams are dropped while the backend boots; the client retries
+//! Sleeping   a QUIC Initial gets a Retry and starts the backend
+//! Waking     a Retry answers each Initial while the backend boots
 //! Running    datagrams are relayed to the backend
 //!            no sessions for idle_timeout -> stop the backend -> Sleeping
 //! ```
@@ -108,9 +108,9 @@ impl Proxy {
         }
     }
 
-    /// Boot the backend. Knocks that arrive meanwhile are dropped: the client retransmits
-    /// its Initial and retries the whole connection, so one of those attempts lands on the
-    /// relay once the backend is ready.
+    /// Boot the backend. Knocks that arrive meanwhile are answered with a Retry (see
+    /// [`crate::retry`]) and otherwise dropped, so the client's handshake timer stays
+    /// alive and its next Initial lands on the relay once the backend is ready.
     async fn wake(
         &self,
         public: &UdpSocket,
@@ -178,13 +178,16 @@ impl Proxy {
         mut backend: Box<dyn Backend>,
         shutdown: &mut std::pin::Pin<&mut impl Future<Output = ()>>,
     ) -> Result<Stop> {
-        // Datagrams that arrived during the Waking→Running handoff can sit in the
-        // socket buffer. Relaying them is dangerous: the client may already have
-        // abandoned that QUIC connection attempt, and a stale Initial can collide
-        // with the fresh retry. Drop everything that was already queued.
-        let drained = drain_public(public).await;
-        tracing::debug!(drained, "cleared stale datagrams before relaying");
-
+        // Nothing is drained here. `wake()`'s own loop already reads and drops every
+        // datagram throughout the whole boot, so nothing backs up on the socket while
+        // Waking is in progress — whatever is queued the instant this runs arrived in the
+        // last few microseconds and is exactly the datagram that should complete the
+        // connection now that the backend is ready. An earlier version dropped it on the
+        // theory that a queued datagram might belong to an attempt the client had already
+        // abandoned; that cost every wake a full extra client retry cycle for a collision
+        // that can't happen (an abandoned attempt uses different connection IDs, so it
+        // can't corrupt a live one — worst case the backend gets a half-open connection
+        // that expires on its own, the same as ordinary network jitter).
         let relay = Arc::new(Relay::new(
             Arc::clone(public),
             self.config.backend,
@@ -280,20 +283,6 @@ async fn send_retry(public: &UdpSocket, initial: &[u8], from: SocketAddr) {
     }
 }
 
-/// Drop any datagrams already queued on the public socket.
-///
-/// Used once when transitioning from `Waking` to `Running` so that traffic the client
-/// sent while the backend was still booting does not leak into the live relay.
-async fn drain_public(public: &UdpSocket) -> usize {
-    let mut buf = vec![0u8; MAX_DATAGRAM];
-    let mut count = 0;
-    while let Ok((len, from)) = public.try_recv_from(&mut buf) {
-        tracing::debug!(%from, bytes = len, "dropping a stale datagram");
-        count += 1;
-    }
-    count
-}
-
 /// Bind the public port, serving both address families from one socket where possible.
 ///
 /// The real server opens an IPv4 and an IPv6 channel (`QUICTransport`, "Using IPv4/IPv6
@@ -363,6 +352,85 @@ mod tests {
         timeout(Duration::from_secs(1), task)
             .await
             .expect("sleeping proxy did not stop promptly")
+            .unwrap()
+            .unwrap();
+    }
+
+    /// A `Backend` that is already "ready" the instant it exists — `serve()` never calls
+    /// `start`/`wait_until_ready` itself, so this only needs to satisfy the trait.
+    struct StubBackend;
+
+    impl Backend for StubBackend {
+        fn start<'a>(&'a mut self) -> crate::infra::BoxFuture<'a, Result<std::time::Instant>> {
+            Box::pin(async { Ok(std::time::Instant::now()) })
+        }
+        fn wait_until_ready<'a>(
+            &'a mut self,
+            _deadline: std::time::Instant,
+        ) -> crate::infra::BoxFuture<'a, Result<()>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn has_exited(&mut self) -> Result<bool> {
+            Ok(false)
+        }
+        fn stop<'a>(&'a mut self) -> crate::infra::BoxFuture<'a, Result<()>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    /// Regression test for the Waking→Running handoff: a datagram already sitting on the
+    /// public socket the instant `serve()` starts must reach the backend, not be dropped.
+    /// This used to fail — `serve()` drained and discarded exactly this datagram on the
+    /// theory that it might belong to an attempt the client had already abandoned, which
+    /// in practice meant the datagram that would have completed the connection right after
+    /// boot was thrown away instead.
+    #[tokio::test]
+    async fn a_datagram_queued_at_the_handoff_is_relayed_not_dropped() {
+        let public = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let public_addr = public.local_addr().unwrap();
+        let backend_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let backend_addr = backend_socket.local_addr().unwrap();
+
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        client.send_to(&[0xaa; 32], public_addr).await.unwrap();
+        // Give the kernel a moment to enqueue it before `serve()` (and thus its relay pump)
+        // ever starts reading — otherwise this wouldn't reproduce "already queued".
+        sleep(Duration::from_millis(10)).await;
+
+        let config = Config {
+            backend: backend_addr,
+            ..Config::default()
+        };
+        let proxy = Proxy::new(config);
+
+        let (stop, stopped) = oneshot::channel();
+        let task = {
+            let public = Arc::clone(&public);
+            tokio::spawn(async move {
+                let shutdown = async move {
+                    let _ = stopped.await;
+                };
+                tokio::pin!(shutdown);
+                proxy
+                    .serve(&public, Box::new(StubBackend), &mut shutdown)
+                    .await
+            })
+        };
+
+        let mut buf = [0u8; 64];
+        let (len, _) = timeout(
+            Duration::from_millis(500),
+            backend_socket.recv_from(&mut buf),
+        )
+        .await
+        .expect("the datagram queued before `serve()` started was never relayed")
+        .unwrap();
+        assert_eq!(&buf[..len], &[0xaa; 32]);
+
+        stop.send(()).unwrap();
+        timeout(Duration::from_secs(1), task)
+            .await
+            .expect("serve did not shut down promptly")
             .unwrap()
             .unwrap();
     }

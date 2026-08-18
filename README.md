@@ -3,15 +3,18 @@
 Runs a Hytale server only while someone is playing.
 
 sleepytale owns the public UDP port. While the server is down, the first QUIC Initial
-from a client boots the backend; the proxy answers it with a QUIC Retry so the client
-sees the server is alive, and the client's own retry lands on the running server. Once up
-it relays raw UDP, so QUIC and mTLS run end-to-end and `--auth-mode=authenticated` is
-unaffected. After `idle_timeout` with no sessions, the backend is stopped and the port
+from a client boots the backend; the proxy answers it with a QUIC Retry so the client's
+own handshake timer doesn't expire while the backend boots, and its next Initial lands on
+the running server. The client isn't infinitely patient — it gives up after about ten
+seconds of silence — so nothing queued at the moment the backend finishes booting is
+dropped either; that datagram is usually the one that finishes the connection. Once up,
+the proxy relays raw UDP, so QUIC and mTLS run end-to-end and `--auth-mode=authenticated`
+is unaffected. After `idle_timeout` with no sessions, the backend is stopped and the port
 goes quiet again.
 
 ```
-Sleeping   public socket answers a QUIC Initial with a Retry and starts the backend
-Waking     a Retry answers each Initial while the backend boots; the client retries
+Sleeping   a QUIC Initial gets a Retry and starts the backend
+Waking     a Retry answers each Initial while the backend boots
 Running    datagrams are relayed to the backend
 ```
 

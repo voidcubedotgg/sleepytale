@@ -42,6 +42,7 @@ All keys are optional; durations are plain seconds.
 | `server.args` | `["-jar", "HytaleServer.jar"]` | Arguments; `-b <backend>` is appended. |
 | `server.working_dir` | `.` | Working directory for the child process. |
 | `server.forward_stdin` | `true` | Forward this process's stdin to the server console. |
+| `routes` | empty | SNI-named backend configurations; unmatched connections use `backend` and `server`. |
 
 ```toml
 idle_timeout = 30
@@ -51,6 +52,23 @@ command = "java"
 args = ["-Xmx8G", "-jar", "HytaleServer.jar", "--assets", "Assets.zip"]
 working_dir = "./hytale"
 ```
+
+Several sleeping servers can share the public port. Each named route has its own private
+bind address and infrastructure adapter configuration; at most one backend may enable
+`forward_stdin`.
+
+```toml
+[routes."creative.example.com"]
+backend = "127.0.0.1:5531"
+command = "java"
+args = ["-jar", "CreativeServer.jar"]
+working_dir = "./creative"
+forward_stdin = false
+```
+
+The first QUIC Initial exposes the TLS `server_name`, which selects a route. The proxy
+decrypts only that Initial and forwards its original bytes unchanged; later packets stay
+opaque and follow the selected session.
 
 Readiness comes from the server's own boot banner (`Hytale Server Booted!`), not from
 probing the port.

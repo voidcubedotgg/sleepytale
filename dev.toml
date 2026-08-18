@@ -1,9 +1,10 @@
-idle_timeout = 30
-[server]
+[routes."127.0.0.1.sslip.io"]
+backend = "127.0.0.1:5531"
 command = "java"
 args = [
   "-Xmx8G",
-  "-jar", "HytaleServer.jar",
-  "--assets", "Assets.zip",
+  "-jar", "/home/vscode/.hytale/HytaleServer.jar",
+  "--assets", "/home/vscode/.hytale/Assets.zip",
 ]
 working_dir="./hytale"
+forward_stdin = false

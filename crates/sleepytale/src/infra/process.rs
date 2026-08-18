@@ -9,7 +9,7 @@
 //! safe. Probing the UDP port would report ready far too early — QUIC binds before the
 //! world finishes loading.
 
-use crate::config::Config;
+use crate::config::{BackendConfig, Config};
 use crate::infra::console::ConsoleInput;
 use crate::infra::{Backend, BoxFuture};
 use anyhow::{Context, Result, bail};
@@ -44,11 +44,15 @@ impl ProcessBackend {
     /// Prepare a process backend from the proxy configuration.
     ///
     /// The backend is not started until [`Backend::start`] is called.
-    pub fn new(config: &Config, console: Option<Arc<ConsoleInput>>) -> Result<Self> {
+    pub fn new(
+        config: &Config,
+        backend: &BackendConfig,
+        console: Option<Arc<ConsoleInput>>,
+    ) -> Result<Self> {
         Ok(Self {
-            command: config.server.command.clone(),
-            args: config.server_args(),
-            working_dir: config.server.working_dir.clone(),
+            command: backend.server.command.clone(),
+            args: backend.server_args(),
+            working_dir: backend.server.working_dir.clone(),
             boot_timeout: config.boot_timeout,
             shutdown_grace: config.shutdown_grace,
             console,
@@ -96,7 +100,11 @@ impl Backend for ProcessBackend {
             self.started_at = Some(Instant::now());
 
             let stdout = child.stdout.take().context("child stdout was not piped")?;
-            mirror_stdout(stdout, Arc::clone(&self.booted), Arc::clone(&self.boot_notify));
+            mirror_stdout(
+                stdout,
+                Arc::clone(&self.booted),
+                Arc::clone(&self.boot_notify),
+            );
 
             let stderr = child.stderr.take().context("child stderr was not piped")?;
             tokio::spawn(async move {
@@ -116,10 +124,7 @@ impl Backend for ProcessBackend {
         })
     }
 
-    fn wait_until_ready<'a>(
-        &'a mut self,
-        deadline: Instant,
-    ) -> BoxFuture<'a, Result<()>> {
+    fn wait_until_ready<'a>(&'a mut self, deadline: Instant) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
             if self.booted.load(Ordering::Acquire) {
                 return Ok(());
@@ -321,7 +326,7 @@ mod tests {
         let config = shell_config(
             "echo starting; echo '\\033[32m         Hytale Server Booted! [x] took 1s'; sleep 30",
         );
-        let mut backend = ProcessBackend::new(&config, None).unwrap();
+        let mut backend = ProcessBackend::new(&config, &config.default_backend(), None).unwrap();
         let deadline = backend.start().await.unwrap();
         backend.wait_until_ready(deadline).await.unwrap();
         backend.stop().await.unwrap();
@@ -330,7 +335,7 @@ mod tests {
     #[tokio::test]
     async fn reports_a_backend_that_dies_while_starting() {
         let config = shell_config("echo loading; exit 3");
-        let mut backend = ProcessBackend::new(&config, None).unwrap();
+        let mut backend = ProcessBackend::new(&config, &config.default_backend(), None).unwrap();
         let deadline = backend.start().await.unwrap();
         let err = backend.wait_until_ready(deadline).await.unwrap_err();
         assert!(
@@ -344,7 +349,7 @@ mod tests {
     async fn times_out_when_the_banner_never_arrives() {
         let mut config = shell_config("sleep 30");
         config.boot_timeout = Duration::from_millis(300);
-        let mut backend = ProcessBackend::new(&config, None).unwrap();
+        let mut backend = ProcessBackend::new(&config, &config.default_backend(), None).unwrap();
         let deadline = backend.start().await.unwrap();
         let err = backend.wait_until_ready(deadline).await.unwrap_err();
         assert!(err.to_string().contains("did not report"), "{err}");
@@ -355,7 +360,7 @@ mod tests {
     async fn kills_a_backend_that_ignores_sigterm() {
         let mut config = shell_config("trap '' TERM; echo 'Hytale Server Booted!'; sleep 30");
         config.shutdown_grace = Duration::from_millis(300);
-        let mut backend = ProcessBackend::new(&config, None).unwrap();
+        let mut backend = ProcessBackend::new(&config, &config.default_backend(), None).unwrap();
         let deadline = backend.start().await.unwrap();
         backend.wait_until_ready(deadline).await.unwrap();
         backend.stop().await.unwrap();
@@ -375,7 +380,7 @@ mod tests {
         ));
         config.shutdown_grace = Duration::from_millis(300);
 
-        let mut backend = ProcessBackend::new(&config, None).unwrap();
+        let mut backend = ProcessBackend::new(&config, &config.default_backend(), None).unwrap();
         let deadline = backend.start().await.unwrap();
         backend.wait_until_ready(deadline).await.unwrap();
         let grandchild: i32 = std::fs::read_to_string(&pidfile)

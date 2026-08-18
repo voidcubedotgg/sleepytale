@@ -48,9 +48,9 @@ know the concrete provider type.
    `Instant` deadline by which the backend must become ready. The caller passes
    that same deadline back to `wait_until_ready`.
 2. **`wait_until_ready`** — block until the backend reports readiness, the
-   deadline expires, or the backend exits early. This is rebuilt on every
-   incoming datagram during the `Waking` state, so the deadline must be absolute
-   (not per-call) to prevent a retrying client from keeping a hung backend alive.
+   deadline expires, or the backend exits early. The route's waking task uses the
+   absolute deadline returned by `start`, so retried client datagrams cannot extend a
+   hung startup.
 3. **`has_exited`** — cheap poll used in the `Running` state to detect that the
    backend died on its own.
 4. **`stop`** — request shutdown and wait for the resource to disappear. For the
@@ -87,9 +87,11 @@ pub enum BackendProvider {
 }
 ```
 
-The factory `infra::create_backend` matches on `config.server.provider` and
-returns `Box<dyn Backend>`. Existing configs continue to work because the field
-defaults to `"process"`.
+The factory `infra::create_backend` receives the global timing configuration plus a
+`BackendConfig`, matches on `backend.server.provider`, and returns `Box<dyn Backend>`.
+The top-level `backend` and `server` form the default `BackendConfig`; SNI routes supply
+additional ones. Existing configs continue to work because the field defaults to
+`"process"`.
 
 ```toml
 [server]
@@ -107,11 +109,12 @@ To add Docker, Podman, Kubernetes, Fly.io, etc.:
 3. Add the match arm in `infra::create_backend`.
 4. Update `README.md` and this document.
 
-Provider-specific configuration should live in `ServerConfig` (or a future
-`BackendConfig`) and be ignored by providers that do not use it. Keep the trait
-surface small: if a provider cannot support console input, it simply does not
-use `ConsoleInput`; if it cannot detect the boot banner from logs, it must
-implement an equivalent readiness check that satisfies the same contract.
+Provider-specific configuration should live in `ServerConfig`, which is embedded in a
+`BackendConfig`, and be ignored by providers that do not use it. Keep the trait surface
+small: if a provider cannot support console input, it simply does not use
+`ConsoleInput`; if it cannot detect the boot banner from logs, it must implement an
+equivalent readiness check that satisfies the same contract. See
+[`sni-routing.md`](sni-routing.md) for how a `BackendConfig` is selected.
 
 ## Design notes
 

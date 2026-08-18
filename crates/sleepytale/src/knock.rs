@@ -5,8 +5,14 @@
 //! is told `ServerDisconnect` before authentication closes the connection and reports it
 //! as a network error rather than showing the reason (client 0.5.7 — verified against a
 //! byte-perfect `ServerDisconnect`, which it read, acted on, and did not render). Silence
-//! is the one response the client handles well: it times out after ten seconds and dials
-//! again, and its retransmitted Initials land on the relay as soon as the backend is up.
+//! is the one response *at that layer* the client handles well: it times out after ten
+//! seconds and dials again, and its retransmitted Initials land on the relay as soon as
+//! the backend is up.
+//!
+//! A QUIC Retry (see [`crate::retry`]) is different from `ServerDisconnect`, not another
+//! instance of the same mistake: it is sent before any handshake exists, so a compliant
+//! client reads it as "the server is here, retry" rather than as the failure of a
+//! connection it thought had progressed further. The proxy still sends it.
 //!
 //! So the only thing the proxy needs from a sleeping port is "someone is trying to
 //! connect", which the shape of a QUIC Initial packet answers.

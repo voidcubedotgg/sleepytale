@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+aes-gcm.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 serde.workspace = true

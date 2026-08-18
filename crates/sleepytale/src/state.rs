@@ -9,16 +9,19 @@
 //!
 //! One socket serves all three states, so the public port is never released and there is
 //! no window where the address is unbound. What changes between states is only what the
-//! proxy does with a datagram: ignore it, drop it, or relay it.
+//! proxy does with a datagram: ignore it, answer it with a Retry, or relay it.
 //!
-//! Nothing is ever sent back from Sleeping or Waking. See [`crate::knock`] for why
-//! silence is the only response this client handles well.
+//! A QUIC Initial gets a Retry back in Sleeping and Waking — see [`crate::retry`] for why
+//! that is safe to send before the backend exists. Nothing else is ever answered; see
+//! [`crate::knock`] for why silence is the only response this client handles well for
+//! anything past that.
 
 use crate::config::Config;
 use crate::infra::console::ConsoleInput;
 use crate::infra::{self, Backend};
 use crate::knock::is_quic_initial;
 use crate::relay::Relay;
+use crate::retry;
 use anyhow::{Context, Result};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -98,6 +101,7 @@ impl Proxy {
 
             if is_quic_initial(&buf[..len]) {
                 tracing::info!(%from, "client knocked; waking the backend");
+                send_retry(public, &buf[..len], from).await;
                 return Ok(true);
             }
             tracing::debug!(%from, bytes = len, "ignoring a datagram that is not a QUIC Initial");
@@ -141,11 +145,16 @@ impl Proxy {
                 result = backend.wait_until_ready(deadline) => break result,
                 received = public.recv_from(&mut buf) => {
                     match received {
-                        Ok((len, from)) => tracing::debug!(
-                            %from,
-                            bytes = len,
-                            "dropping a datagram while the backend boots"
-                        ),
+                        Ok((len, from)) => {
+                            tracing::debug!(
+                                %from,
+                                bytes = len,
+                                "dropping a datagram while the backend boots"
+                            );
+                            if is_quic_initial(&buf[..len]) {
+                                send_retry(public, &buf[..len], from).await;
+                            }
+                        }
                         Err(e) => tracing::debug!(error = %e, "public socket read failed"),
                     }
                 }
@@ -255,6 +264,19 @@ impl Proxy {
                 }
             }
         }
+    }
+}
+
+/// Reply to a client's QUIC Initial with a Retry, so the client sees the server is alive
+/// while the backend is still starting. Best-effort: a send failure here is no worse than
+/// the silence this replaces, so it is only logged.
+async fn send_retry(public: &UdpSocket, initial: &[u8], from: SocketAddr) {
+    let Some(packet) = retry::build(initial) else {
+        tracing::debug!(%from, "not replying with a retry: the Initial header did not parse");
+        return;
+    };
+    if let Err(e) = public.send_to(&packet, from).await {
+        tracing::debug!(%from, error = %e, "failed to send a retry");
     }
 }
 

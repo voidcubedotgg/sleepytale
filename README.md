@@ -2,21 +2,24 @@
 
 Runs a Hytale server only while someone is playing.
 
-sleepytale owns the public UDP port. While the server is down, the first QUIC Initial
-from a client boots the backend; the proxy answers it with a QUIC Retry so the client's
-own handshake timer doesn't expire while the backend boots, and its next Initial lands on
-the running server. The client isn't infinitely patient — it gives up after about ten
-seconds of silence — so nothing queued at the moment the backend finishes booting is
-dropped either; that datagram is usually the one that finishes the connection. Once up,
-the proxy relays raw UDP, so QUIC and mTLS run end-to-end and `--auth-mode=authenticated`
-is unaffected. After `idle_timeout` with no sessions, the backend is stopped and the port
-goes quiet again.
+sleepytale owns the public UDP port and stays silent on it: it never answers a handshake
+it does not terminate. While the server is down, the first QUIC Initial from a client
+boots the backend, and that Initial is *held* rather than dropped — along with any that
+arrive while the boot runs — then delivered the moment the backend is ready. The client
+gives up after about ten seconds and does not redial on its own, so its first attempt has
+to be the one that lands; holding it means a player connects on the first try instead of
+waiting out a timeout. Once up, the proxy relays raw UDP, so QUIC and mTLS run end-to-end
+and `--auth-mode=authenticated` is unaffected. After `idle_timeout` with no sessions, the
+backend is stopped and the port goes quiet again.
 
 ```
-Sleeping   a QUIC Initial gets a Retry and starts the backend
-Waking     a Retry answers each Initial while the backend boots
-Running    datagrams are relayed to the backend
+Sleeping   the public socket is quiet; a QUIC Initial starts the backend
+Waking     Initials are held while the backend boots; everything else is dropped
+Running    held Initials are delivered, then datagrams are relayed to the backend
 ```
+
+A boot slower than the client's ten-second patience will still fail that first attempt —
+holding cannot buy more time than the client allows, only make sure none of it is wasted.
 
 ## Usage
 

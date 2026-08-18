@@ -13,16 +13,20 @@
 //! the ten-second window has to survive on its own; nothing about it makes a slow boot
 //! safe by itself.
 //!
-//! A QUIC Retry (see [`crate::retry`]) is different from `ServerDisconnect`, not another
-//! instance of the same mistake: it is sent before any handshake exists, so a compliant
-//! client reads it as "the server is here, retry" rather than as the failure of a
-//! connection it thought had progressed further, and receiving one is what keeps the
-//! client's own handshake timer from expiring while Waking runs long. The proxy still
-//! sends it — and now takes care not to drop the datagram that answers it right at the
-//! Waking→Running handoff (see `state::serve`), since that datagram, not another retry, is
-//! usually the one that finishes the connection.
+//! A QUIC Retry looks like the missing answer here — it is sent before any handshake
+//! exists, so it avoids the `ServerDisconnect` trap — but it cannot work through a relay
+//! that does not terminate the handshake. `RFC 9000` requires the client to repeat the
+//! Retry's token in every later Initial (§8.1.2) and to abort if the server omits
+//! `retry_source_connection_id` (§7.3). Those Initials reach the *backend*, which issued
+//! no token and sent no Retry, so it rejects them. A Retry with an empty token is worse
+//! still: §17.2.5.2 makes the client discard it unread, which is silence dressed up as a
+//! reply. This was tried and reverted.
 //!
-//! So the only thing the proxy needs from a sleeping port is "someone is trying to
+//! So the proxy answers nothing, and instead makes the client's own Initial count: it is
+//! held while the backend boots and delivered the moment it is ready (see `state::wake`),
+//! which needs no forged packets and no reply the proxy has no standing to send.
+//!
+//! The only thing the proxy needs from a sleeping port is therefore "someone is trying to
 //! connect", which the shape of a QUIC Initial packet answers.
 
 /// Does this datagram look like a client opening a QUIC v1 connection?

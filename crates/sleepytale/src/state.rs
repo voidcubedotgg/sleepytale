@@ -1,28 +1,29 @@
 //! The proxy's lifecycle: sleeping, waking, running.
 //!
 //! ```text
-//! Sleeping   a QUIC Initial gets a Retry and starts the backend
-//! Waking     a Retry answers each Initial while the backend boots
-//! Running    datagrams are relayed to the backend
+//! Sleeping   the public socket is quiet; a QUIC Initial starts the backend
+//! Waking     Initials are held while the backend boots; everything else is dropped
+//! Running    held Initials are delivered, then datagrams are relayed to the backend
 //!            no sessions for idle_timeout -> stop the backend -> Sleeping
 //! ```
 //!
 //! One socket serves all three states, so the public port is never released and there is
 //! no window where the address is unbound. What changes between states is only what the
-//! proxy does with a datagram: ignore it, answer it with a Retry, or relay it.
+//! proxy does with a datagram: ignore it, hold it, or relay it.
 //!
-//! A QUIC Initial gets a Retry back in Sleeping and Waking — see [`crate::retry`] for why
-//! that is safe to send before the backend exists. Nothing else is ever answered; see
-//! [`crate::knock`] for why silence is the only response this client handles well for
-//! anything past that.
+//! Nothing is ever sent back from Sleeping or Waking. The proxy does not terminate the
+//! QUIC handshake, so it cannot answer one either — see [`crate::knock`]. What it can do
+//! is deliver the client's own Initial late: a connection attempt that arrives mid-boot is
+//! held and forwarded the moment the backend is ready, so the client does not have to
+//! retransmit for the connection to succeed.
 
 use crate::config::Config;
 use crate::infra::console::ConsoleInput;
 use crate::infra::{self, Backend};
 use crate::knock::is_quic_initial;
 use crate::relay::Relay;
-use crate::retry;
 use anyhow::{Context, Result};
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -33,6 +34,16 @@ use tokio::time::{Duration, Instant, MissedTickBehavior, interval};
 const TICK: Duration = Duration::from_secs(5);
 
 const MAX_DATAGRAM: usize = 64 * 1024;
+
+/// How many distinct clients can have an Initial held during one boot.
+///
+/// Only the newest Initial per address is kept, so this bounds the hold to a handful of
+/// datagrams however long the boot runs. Clients past the cap are simply not held; they
+/// still connect the moment they retransmit against the running relay.
+const MAX_HELD_CLIENTS: usize = 8;
+
+/// Client Initials received while the backend was booting, newest per address.
+type HeldInitials = HashMap<SocketAddr, Vec<u8>>;
 
 pub struct Proxy {
     config: Config,
@@ -55,19 +66,22 @@ impl Proxy {
         loop {
             // --- Sleeping: ignore the port until someone dials in. ---
             tracing::info!(listen = %self.config.listen, "sleeping");
-            if !self.wait_for_knock(&public, &mut shutdown).await? {
+            let Some(knock) = self.wait_for_knock(&public, &mut shutdown).await? else {
                 return Ok(());
-            }
+            };
 
-            // --- Waking: boot the backend, dropping traffic until it is ready. ---
-            let backend = match self.wake(&public, console.clone(), &mut shutdown).await? {
-                Wake::Running(backend) => backend,
+            // --- Waking: boot the backend, holding Initials until it is ready. ---
+            let (backend, held) = match self
+                .wake(&public, knock, console.clone(), &mut shutdown)
+                .await?
+            {
+                Wake::Running(backend, held) => (backend, held),
                 Wake::Shutdown => return Ok(()),
                 Wake::Failed => continue,
             };
 
             // --- Running: relay until idle. ---
-            match self.serve(&public, backend, &mut shutdown).await? {
+            match self.serve(&public, backend, held, &mut shutdown).await? {
                 Stop::Shutdown => return Ok(()),
                 Stop::BackendGone | Stop::Idle => {}
             }
@@ -75,16 +89,19 @@ impl Proxy {
     }
 
     /// Wait for a client to try to connect.
-    /// Returns `true` after a knock, or `false` when the proxy is stopping.
+    ///
+    /// Returns the Initial that woke the proxy, or `None` when the proxy is stopping. The
+    /// datagram is carried out so it can be delivered once the backend is up: it is the
+    /// client's live connection attempt, not just a signal that someone knocked.
     async fn wait_for_knock(
         &self,
         public: &UdpSocket,
         shutdown: &mut std::pin::Pin<&mut impl Future<Output = ()>>,
-    ) -> Result<bool> {
+    ) -> Result<Option<(SocketAddr, Vec<u8>)>> {
         let mut buf = vec![0u8; MAX_DATAGRAM];
         loop {
             let received = tokio::select! {
-                () = shutdown.as_mut() => return Ok(false),
+                () = shutdown.as_mut() => return Ok(None),
                 received = public.recv_from(&mut buf) => received,
             };
             // A read error here is per-datagram, not fatal: Linux reports a queued ICMP
@@ -101,22 +118,29 @@ impl Proxy {
 
             if is_quic_initial(&buf[..len]) {
                 tracing::info!(%from, "client knocked; waking the backend");
-                send_retry(public, &buf[..len], from).await;
-                return Ok(true);
+                return Ok(Some((from, buf[..len].to_vec())));
             }
             tracing::debug!(%from, bytes = len, "ignoring a datagram that is not a QUIC Initial");
         }
     }
 
-    /// Boot the backend. Knocks that arrive meanwhile are answered with a Retry (see
-    /// [`crate::retry`]) and otherwise dropped, so the client's handshake timer stays
-    /// alive and its next Initial lands on the relay once the backend is ready.
+    /// Boot the backend, holding the client Initials that arrive meanwhile.
+    ///
+    /// Only the newest Initial per address is kept: an older one from the same client is a
+    /// retransmission of the same connection attempt, so the newest is the one worth
+    /// delivering. Everything else is dropped — it belongs to a connection that no longer
+    /// exists, and the backend would have nothing to match it against.
     async fn wake(
         &self,
         public: &UdpSocket,
+        knock: (SocketAddr, Vec<u8>),
         console: Option<Arc<ConsoleInput>>,
         shutdown: &mut std::pin::Pin<&mut impl Future<Output = ()>>,
     ) -> Result<Wake> {
+        let mut held: HeldInitials = HashMap::new();
+        let (from, datagram) = knock;
+        held.insert(from, datagram);
+
         let mut backend = match infra::create_backend(&self.config, console) {
             Ok(backend) => backend,
             Err(e) => {
@@ -146,13 +170,21 @@ impl Proxy {
                 received = public.recv_from(&mut buf) => {
                     match received {
                         Ok((len, from)) => {
-                            tracing::debug!(
-                                %from,
-                                bytes = len,
-                                "dropping a datagram while the backend boots"
-                            );
-                            if is_quic_initial(&buf[..len]) {
-                                send_retry(public, &buf[..len], from).await;
+                            let holding = is_quic_initial(&buf[..len])
+                                && (held.contains_key(&from) || held.len() < MAX_HELD_CLIENTS);
+                            if holding {
+                                held.insert(from, buf[..len].to_vec());
+                                tracing::debug!(
+                                    %from,
+                                    bytes = len,
+                                    "holding an Initial until the backend is ready"
+                                );
+                            } else {
+                                tracing::debug!(
+                                    %from,
+                                    bytes = len,
+                                    "dropping a datagram while the backend boots"
+                                );
                             }
                         }
                         Err(e) => tracing::debug!(error = %e, "public socket read failed"),
@@ -162,7 +194,7 @@ impl Proxy {
         };
 
         match ready {
-            Ok(()) => Ok(Wake::Running(backend)),
+            Ok(()) => Ok(Wake::Running(backend, held)),
             Err(e) => {
                 tracing::error!(error = %e, "backend failed to start");
                 backend.stop().await?;
@@ -172,28 +204,41 @@ impl Proxy {
     }
 
     /// Relay traffic until the server goes idle, dies, or the proxy is shut down.
+    ///
+    /// `held` carries the Initials collected while the backend was booting; they are
+    /// delivered before the relay starts reading, so a client that connected mid-boot does
+    /// not have to retransmit for its attempt to reach the server.
     async fn serve(
         &self,
         public: &Arc<UdpSocket>,
         mut backend: Box<dyn Backend>,
+        held: HeldInitials,
         shutdown: &mut std::pin::Pin<&mut impl Future<Output = ()>>,
     ) -> Result<Stop> {
-        // Nothing is drained here. `wake()`'s own loop already reads and drops every
-        // datagram throughout the whole boot, so nothing backs up on the socket while
-        // Waking is in progress — whatever is queued the instant this runs arrived in the
-        // last few microseconds and is exactly the datagram that should complete the
-        // connection now that the backend is ready. An earlier version dropped it on the
-        // theory that a queued datagram might belong to an attempt the client had already
-        // abandoned; that cost every wake a full extra client retry cycle for a collision
-        // that can't happen (an abandoned attempt uses different connection IDs, so it
-        // can't corrupt a live one — worst case the backend gets a half-open connection
-        // that expires on its own, the same as ordinary network jitter).
+        // Nothing is drained here. Datagrams queued on the socket at this instant arrived
+        // in the last few microseconds and belong to a live connection attempt; an earlier
+        // version dropped them on the theory that they might belong to an attempt the
+        // client had already abandoned, which cost every wake a full extra client retry
+        // cycle for a collision that can't happen (an abandoned attempt uses different
+        // connection IDs, so it can't corrupt a live one — worst case the backend gets a
+        // half-open connection that expires on its own, the same as ordinary jitter).
         let relay = Arc::new(Relay::new(
             Arc::clone(public),
             self.config.backend,
             self.config.session_timeout,
         ));
         tracing::info!(backend = %self.config.backend, "running");
+
+        for (from, datagram) in &held {
+            match relay.forward_to_backend(*from, datagram).await {
+                Ok(()) => tracing::debug!(
+                    %from,
+                    bytes = datagram.len(),
+                    "delivered an Initial held during boot"
+                ),
+                Err(e) => tracing::debug!(%from, error = %e, "could not deliver a held Initial"),
+            }
+        }
 
         let stop = Arc::new(AtomicBool::new(false));
         let pump = {
@@ -270,19 +315,6 @@ impl Proxy {
     }
 }
 
-/// Reply to a client's QUIC Initial with a Retry, so the client sees the server is alive
-/// while the backend is still starting. Best-effort: a send failure here is no worse than
-/// the silence this replaces, so it is only logged.
-async fn send_retry(public: &UdpSocket, initial: &[u8], from: SocketAddr) {
-    let Some(packet) = retry::build(initial) else {
-        tracing::debug!(%from, "not replying with a retry: the Initial header did not parse");
-        return;
-    };
-    if let Err(e) = public.send_to(&packet, from).await {
-        tracing::debug!(%from, error = %e, "failed to send a retry");
-    }
-}
-
 /// Bind the public port, serving both address families from one socket where possible.
 ///
 /// The real server opens an IPv4 and an IPv6 channel (`QUICTransport`, "Using IPv4/IPv6
@@ -318,7 +350,7 @@ enum Stop {
 
 enum Wake {
     // Boxed: a concrete backend dwarfs the other two variants, and this is built once per wake.
-    Running(Box<dyn Backend>),
+    Running(Box<dyn Backend>, HeldInitials),
     Failed,
     Shutdown,
 }
@@ -412,7 +444,12 @@ mod tests {
                 };
                 tokio::pin!(shutdown);
                 proxy
-                    .serve(&public, Box::new(StubBackend), &mut shutdown)
+                    .serve(
+                        &public,
+                        Box::new(StubBackend),
+                        HeldInitials::new(),
+                        &mut shutdown,
+                    )
                     .await
             })
         };
@@ -429,6 +466,144 @@ mod tests {
 
         stop.send(()).unwrap();
         timeout(Duration::from_secs(1), task)
+            .await
+            .expect("serve did not shut down promptly")
+            .unwrap()
+            .unwrap();
+    }
+
+    /// An Initial-shaped datagram, padded to the 1200 bytes a real client sends.
+    fn initial() -> Vec<u8> {
+        let mut datagram = vec![0u8; 1200];
+        datagram[0] = 0xc3; // long header, fixed bit, Initial
+        datagram[1..5].copy_from_slice(&[0, 0, 0, 1]); // QUIC v1
+        datagram
+    }
+
+    /// A proxy whose "server" is a shell script that prints the boot banner after `boot`,
+    /// so `wake()` runs its real path (process spawn, banner scan) on a predictable clock.
+    fn shell_proxy(backend: SocketAddr, boot: Duration) -> Proxy {
+        let mut config = Config {
+            backend,
+            ..Config::default()
+        };
+        config.server.command = "sh".to_string();
+        config.server.args = vec![
+            "-c".to_string(),
+            format!(
+                "sleep {}; echo 'Hytale Server Booted!'; sleep 30",
+                boot.as_secs_f32()
+            ),
+        ];
+        config.server.forward_stdin = false;
+        config.boot_timeout = Duration::from_secs(5);
+        config.shutdown_grace = Duration::from_millis(200);
+        Proxy::new(config)
+    }
+
+    /// Run `wake` then `serve` the way `run()` does, so the held Initials cross the handoff.
+    async fn wake_then_serve(
+        proxy: Proxy,
+        public: Arc<UdpSocket>,
+        knock: (SocketAddr, Vec<u8>),
+        stopped: oneshot::Receiver<()>,
+    ) -> Result<Stop> {
+        let shutdown = async move {
+            let _ = stopped.await;
+        };
+        tokio::pin!(shutdown);
+        let (backend, held) = match proxy.wake(&public, knock, None, &mut shutdown).await? {
+            Wake::Running(backend, held) => (backend, held),
+            Wake::Failed => panic!("the shell backend should have booted"),
+            Wake::Shutdown => panic!("shut down before the backend was ready"),
+        };
+        proxy.serve(&public, backend, held, &mut shutdown).await
+    }
+
+    /// The connection attempt that woke the proxy must reach the backend once it is up.
+    ///
+    /// This is the whole point of waking: the client is sitting in a handshake with a
+    /// deadline of its own, and it does not necessarily retransmit. If the Initial that
+    /// started the boot is never delivered, the player's first attempt fails even though
+    /// the server came up well within their client's patience.
+    #[tokio::test]
+    async fn the_initial_that_woke_the_proxy_reaches_the_backend() {
+        let public = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let backend_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let proxy = shell_proxy(backend_socket.local_addr().unwrap(), Duration::ZERO);
+
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_addr = client.local_addr().unwrap();
+        let knock = initial();
+
+        let (stop, stopped) = oneshot::channel();
+        let task = tokio::spawn(wake_then_serve(
+            proxy,
+            Arc::clone(&public),
+            (client_addr, knock.clone()),
+            stopped,
+        ));
+
+        let mut buf = vec![0u8; 2048];
+        let (len, _) = timeout(Duration::from_secs(5), backend_socket.recv_from(&mut buf))
+            .await
+            .expect("the Initial that woke the proxy never reached the backend")
+            .unwrap();
+        assert_eq!(&buf[..len], &knock[..], "the client's own bytes, unaltered");
+
+        stop.send(()).unwrap();
+        timeout(Duration::from_secs(5), task)
+            .await
+            .expect("serve did not shut down promptly")
+            .unwrap()
+            .unwrap();
+    }
+
+    /// An Initial that arrives *during* the boot is held too, and the newest one per client
+    /// wins — an earlier one from the same address is only a retransmission of the same
+    /// attempt, so delivering the stale copy would be pointless.
+    #[tokio::test]
+    async fn an_initial_arriving_mid_boot_is_held_and_delivered() {
+        let public = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let public_addr = public.local_addr().unwrap();
+        let backend_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let proxy = shell_proxy(
+            backend_socket.local_addr().unwrap(),
+            Duration::from_millis(500),
+        );
+
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_addr = client.local_addr().unwrap();
+
+        // Distinguishable from the knock, so the assertion proves the newer one won.
+        let mut retransmit = initial();
+        retransmit[5..9].copy_from_slice(b"HELD");
+
+        let (stop, stopped) = oneshot::channel();
+        let task = tokio::spawn(wake_then_serve(
+            proxy,
+            Arc::clone(&public),
+            (client_addr, initial()),
+            stopped,
+        ));
+
+        // Land inside the boot window, while `wake` is still waiting for the banner.
+        sleep(Duration::from_millis(100)).await;
+        client.send_to(&retransmit, public_addr).await.unwrap();
+
+        let mut buf = vec![0u8; 2048];
+        let (len, _) = timeout(Duration::from_secs(5), backend_socket.recv_from(&mut buf))
+            .await
+            .expect("the Initial held during boot never reached the backend")
+            .unwrap();
+        assert_eq!(
+            &buf[..len],
+            &retransmit[..],
+            "the newest Initial for this client should win"
+        );
+
+        stop.send(()).unwrap();
+        timeout(Duration::from_secs(5), task)
             .await
             .expect("serve did not shut down promptly")
             .unwrap()
